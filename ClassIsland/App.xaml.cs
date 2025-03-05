@@ -18,6 +18,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Security.Principal;
 
 using ClassIsland.Controls;
 using ClassIsland.Controls.AttachedSettingsControls;
@@ -497,6 +498,24 @@ public partial class App : AppBase, IAppHost
                 services.AddHostedService<WeatherNotificationProvider>();
                 services.AddHostedService<ManagementNotificationProvider>();
                 services.AddHostedService<ActionNotificationProvider>();
+                services.AddSingleton<CustomMessageNotificationProvider>();
+                services.AddHostedService(provider => provider.GetRequiredService<CustomMessageNotificationProvider>());
+                // 添加Web消息服务器
+                services.AddSingleton<WebMessageServer>();
+                
+                // 记录管理员权限状态
+                var isAdmin = IsRunAsAdministrator();
+                Logger?.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);
+                if (isAdmin)
+                {
+                    Logger?.LogInformation("应用程序将以管理员权限运行，WebMessageServer将能够绑定到所有网络接口");
+                }
+                else
+                {
+                    Logger?.LogWarning("应用程序不是以管理员身份运行，WebMessageServer可能仅限本地访问");
+                }
+                
+                services.AddHostedService(provider => provider.GetRequiredService<WebMessageServer>());
                 // Transients
                 services.AddTransient<ExcelImportWindow>();
                 services.AddTransient<WallpaperPreviewWindow>();
@@ -945,5 +964,16 @@ public partial class App : AppBase, IAppHost
             startInfo.ArgumentList.Add(i);
         }
         Process.Start(startInfo);
+    }
+
+    /// <summary>
+    /// 检查应用程序是否以管理员身份运行
+    /// </summary>
+    /// <returns>如果应用程序以管理员身份运行，则返回true</returns>
+    public static bool IsRunAsAdministrator()
+    {
+        var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 }
