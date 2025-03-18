@@ -12,6 +12,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System.Linq;
+using ClassIsland.Core.Abstractions.Services;
+using ClassIsland.Core;
 
 namespace ClassIsland.Services
 {
@@ -22,9 +24,16 @@ namespace ClassIsland.Services
     {
         private readonly ILogger<WebMessageServer> _logger;
         private readonly CustomMessageNotificationProvider _notificationProvider;
+        private readonly ILessonsService _lessonsService;
         private HttpListener? _httpListener;
         private CancellationTokenSource? _cts;
         private Task? _serverTask;
+        private Task? _monitorTask;
+        private const int MAX_RETRY_ATTEMPTS = 3;
+        private const int RETRY_DELAY_MS = 5000;
+        private int _retryCount = 0;
+        private DateTime _lastErrorTime = DateTime.MinValue;
+        private bool _isAppStarted = false;
 
         public bool IsRunning { get; private set; }
         
@@ -48,10 +57,12 @@ namespace ClassIsland.Services
 
         public WebMessageServer(
             ILogger<WebMessageServer> logger,
-            CustomMessageNotificationProvider notificationProvider)
+            CustomMessageNotificationProvider notificationProvider,
+            ILessonsService lessonsService)
         {
             _logger = logger;
             _notificationProvider = notificationProvider;
+            _lessonsService = lessonsService;
             
             // 在构造函数中记录初始化信息
             _logger.LogInformation("WebMessageServer服务已创建，等待启动...");
@@ -63,6 +74,41 @@ namespace ClassIsland.Services
                 string error = "依赖项CustomMessageNotificationProvider不可用";
                 _logger.LogError(error);
                 LastErrorMessage = error;
+            }
+            
+            if (_lessonsService == null)
+            {
+                string error = "依赖项ILessonsService不可用";
+                _logger.LogError(error);
+                LastErrorMessage = error;
+            }
+
+            // 订阅应用启动完成事件
+            var app = AppBase.Current;
+            if (app != null)
+            {
+                app.AppStarted += (_, _) =>
+                {
+                    _logger.LogInformation("收到应用启动完成事件");
+                    _isAppStarted = true;
+                    // 应用启动完成后，尝试启动服务器
+                    if (!IsRunning)
+                    {
+                        _logger.LogInformation("应用启动完成，开始启动Web服务器");
+                        try
+                        {
+                            ManualStart();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "在应用启动完成事件中启动Web服务器失败");
+                        }
+                    }
+                };
+            }
+            else
+            {
+                _logger.LogWarning("无法获取应用实例，服务器可能需要手动启动");
             }
         }
 
@@ -85,6 +131,54 @@ namespace ClassIsland.Services
             }
         }
 
+        private async Task MonitorServerHealthAsync()
+        {
+            while (!_cts?.IsCancellationRequested ?? false)
+            {
+                try 
+                {
+                    if (!IsRunning && (DateTime.Now - _lastErrorTime).TotalSeconds > 30)
+                    {
+                        _logger?.LogWarning("检测到服务器未运行，尝试自动重启...");
+                        _lastErrorTime = DateTime.Now;
+                        
+                        if (_retryCount < MAX_RETRY_ATTEMPTS)
+                        {
+                            _retryCount++;
+                            _logger?.LogInformation($"正在进行第 {_retryCount} 次重试...");
+                            
+                            try
+                            {
+                                await StopAsync(CancellationToken.None);
+                                await Task.Delay(RETRY_DELAY_MS);
+                                await StartAsync(CancellationToken.None);
+                                
+                                if (IsRunning)
+                                {
+                                    _logger?.LogInformation("服务器自动重启成功");
+                                    _retryCount = 0;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogError(ex, "自动重启过程中发生错误");
+                            }
+                        }
+                        else
+                        {
+                            _logger?.LogError($"已达到最大重试次数({MAX_RETRY_ATTEMPTS})，请手动检查服务器状态");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "监控服务器状态时发生错误");
+                }
+                
+                await Task.Delay(10000); // 每10秒检查一次
+            }
+        }
+
         public Task StartAsync(CancellationToken cancellationToken)
         {
             LastErrorMessage = "正在尝试启动服务...";
@@ -92,6 +186,43 @@ namespace ClassIsland.Services
             
             try
             {
+                // 如果应用还没有完全启动，等待应用启动事件
+                if (!_isAppStarted)
+                {
+                    _logger.LogInformation("应用尚未完全启动，等待应用启动事件...");
+                    return Task.CompletedTask;
+                }
+
+                // 如果已经在运行，不做任何操作
+                if (IsRunning)
+                {
+                    _logger.LogInformation("服务器已经在运行中，无需重启");
+                    return Task.CompletedTask;
+                }
+                
+                // 如果有正在运行的任务，先停止
+                if (_serverTask != null || _httpListener != null)
+                {
+                    _logger.LogInformation("检测到之前的服务器实例，先尝试停止...");
+                    try
+                    {
+                        StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "停止之前的服务器实例时出错，这可能不影响新服务器的启动");
+                    }
+                    
+                    // 等待一小段时间确保资源释放
+                    Task.Delay(500).GetAwaiter().GetResult();
+                }
+                
+                // 创建新的取消令牌源
+                _cts = new CancellationTokenSource();
+                
+                // 启动监控任务
+                _monitorTask = MonitorServerHealthAsync();
+                
                 if (_notificationProvider == null)
                 {
                     LastErrorMessage = "自定义提醒服务不可用，无法启动";
@@ -100,208 +231,250 @@ namespace ClassIsland.Services
                     return Task.CompletedTask;
                 }
                 
-                _logger.LogInformation("正在启动Web消息服务器...");
-                _cts = new CancellationTokenSource();
+                // 重置对象状态
+                _httpListener = null;
+                _serverTask = null;
+                IsRunning = false;
                 
-                // 检查管理员权限并记录
-                var isAdmin = IsRunAsAdministrator();
-                _logger.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);
+                // 确保使用固定端口8088
+                Port = 8088;
+                _logger.LogInformation($"使用固定端口: {Port}");
                 
-                // 使用固定端口8088，不再查找可用端口
-                _logger.LogInformation("使用固定端口: {Port}", Port);
+                // 尝试多种方式绑定地址
+                TryBindToAddress();
                 
-                // 重新创建HttpListener - 非常重要，避免使用可能已被释放的对象
-                try
+                if (IsRunning)
                 {
-                    // 确保旧的实例被完全释放
-                    if (_httpListener != null)
-                    {
-                        try
-                        {
-                            if (_httpListener.IsListening)
-                            {
-                                _httpListener.Stop();
-                            }
-                        }
-                        catch { /* 忽略任何错误 */ }
-                        
-                        _httpListener = null;
-                    }
-                    
-                    // 创建全新的HttpListener实例
-                    _httpListener = new HttpListener();
-                }
-                catch (Exception ex)
-                {
-                    LastErrorMessage = $"创建HttpListener实例失败: {ex.Message}";
-                    _logger.LogError(ex, LastErrorMessage);
-                    IsRunning = false;
-                    return Task.CompletedTask;
-                }
-                
-                // 尝试绑定 - 先尝试远程访问（需要管理员权限），失败后回退到本地模式
-                bool bindingSuccess = false;
-                
-                // 1. 如果有管理员权限，优先尝试绑定到所有地址
-                if (isAdmin)
-                {
-                    try
-                    {
-                        string prefix = $"http://+:{Port}/";
-                        _httpListener.Prefixes.Clear();
-                        _httpListener.Prefixes.Add(prefix);
-                        
-                        try
-                        {
-                            _httpListener.Start();
-                            IsRunning = true;
-                            IsLocalOnly = false;
-                            bindingSuccess = true;
-                            LastErrorMessage = null;
-                            _logger.LogInformation("服务器已成功绑定到所有地址: {prefix}，管理员权限启用", prefix);
-                        }
-                        catch (HttpListenerException ex)
-                        {
-                            _logger.LogWarning(ex, "尽管有管理员权限，绑定到所有地址仍然失败，可能是其他原因导致");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "配置远程绑定失败");
-                    }
+                    _logger.LogInformation("服务器自动启动成功，端口: {Port}", Port);
                 }
                 else
                 {
-                    _logger.LogInformation("无管理员权限，将尝试URL保留方式绑定");
+                    _logger.LogWarning("服务器自动启动过程完成，但状态检查显示未运行，可能端口 {Port} 被占用", Port);
                 }
                 
-                // 2. 如果没有管理员权限或者之前的绑定失败，尝试其他方式
-                if (!bindingSuccess)
-                {
-                    // 尝试直接绑定到+，检查是否有URL保留
-                    try
-                    {
-                        // 重新创建HttpListener，避免使用之前可能失败的实例
-                        _httpListener = new HttpListener();
-                        
-                        string prefix = $"http://+:{Port}/";
-                        _httpListener.Prefixes.Clear();
-                        _httpListener.Prefixes.Add(prefix);
-                        
-                        try
-                        {
-                            _httpListener.Start();
-                            IsRunning = true;
-                            IsLocalOnly = false;
-                            bindingSuccess = true;
-                            LastErrorMessage = null;
-                            _logger.LogInformation("服务器通过URL保留成功绑定到所有地址: {prefix}", prefix);
-                        }
-                        catch (HttpListenerException ex)
-                        {
-                            _logger.LogWarning(ex, "绑定到所有地址失败，尝试特定IP绑定或本地模式");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "配置通过URL保留绑定失败");
-                    }
-                }
-                
-                // 3. 如果上述方法都失败，尝试绑定到特定的本地IP地址
-                if (!bindingSuccess)
-                {
-                    try
-                    {
-                        // 重新创建HttpListener
-                        _httpListener = new HttpListener();
-                        
-                        string localIp = GetLocalIPAddress();
-                        if (localIp != "localhost")
-                        {
-                            string prefix = $"http://{localIp}:{Port}/";
-                            _httpListener.Prefixes.Clear();
-                            _httpListener.Prefixes.Add(prefix);
-                            
-                            try
-                            {
-                                _httpListener.Start();
-                                IsRunning = true;
-                                IsLocalOnly = false;
-                                bindingSuccess = true;
-                                LastErrorMessage = null;
-                                _logger.LogInformation("服务器已成功绑定到特定IP: {prefix}", prefix);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "绑定到特定IP失败，将尝试本地模式");
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "配置特定IP绑定失败");
-                    }
-                }
-                
-                // 4. 如果所有尝试都失败，使用本地绑定
-                if (!bindingSuccess)
-                {
-                    try
-                    {
-                        // 重新创建HttpListener，避免使用可能已被部分初始化的实例
-                        _httpListener = new HttpListener();
-                        
-                        string prefix = $"http://localhost:{Port}/";
-                        _httpListener.Prefixes.Clear();
-                        _httpListener.Prefixes.Add(prefix);
-                        
-                        try
-                        {
-                            _httpListener.Start();
-                            IsRunning = true;
-                            IsLocalOnly = true;
-                            bindingSuccess = true;
-                            LastErrorMessage = null;
-                            _logger.LogInformation("服务器已成功绑定到本地地址: {prefix}", prefix);
-                        }
-                        catch (Exception ex)
-                        {
-                            LastErrorMessage = $"启动本地服务器失败: {ex.Message}";
-                            _logger.LogError(ex, LastErrorMessage);
-                            bindingSuccess = false;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LastErrorMessage = $"配置本地绑定失败: {ex.Message}";
-                        _logger.LogError(ex, LastErrorMessage);
-                        bindingSuccess = false;
-                    }
-                }
-                
-                // 如果绑定都失败，返回错误
-                if (!bindingSuccess)
-                {
-                    IsRunning = false;
-                    if (string.IsNullOrEmpty(LastErrorMessage))
-                    {
-                        LastErrorMessage = "服务器绑定失败，请检查端口是否被占用或尝试以管理员身份运行";
-                    }
-                    return Task.CompletedTask;
-                }
-                
-                // 启动请求处理
-                _serverTask = HandleRequestsAsync(_cts.Token);
-                _logger.LogInformation("Web消息服务器启动完成，开始处理请求");
                 return Task.CompletedTask;
             }
             catch (Exception ex)
             {
-                IsRunning = false;
-                LastErrorMessage = $"服务器启动异常: {ex.Message}";
+                LastErrorMessage = $"自动启动服务器失败: {ex.Message}";
                 _logger.LogError(ex, LastErrorMessage);
+                IsRunning = false;
                 return Task.CompletedTask;
+            }
+        }
+
+        private void TryBindToAddress()
+        {
+            bool bindingSuccess = false;
+            int bindingAttempts = 0;
+            
+            _logger.LogInformation("开始尝试绑定Web服务器...");
+            
+            // 检查管理员权限
+            var isAdmin = IsRunAsAdministrator();
+            _logger.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);
+            
+            // 记录系统信息
+            try
+            {
+                string osVersion = Environment.OSVersion.ToString();
+                string httpListenerSupported = HttpListener.IsSupported.ToString();
+                _logger.LogInformation("操作系统版本: {OSVersion}", osVersion);
+                _logger.LogInformation("系统是否支持HttpListener: {Supported}", httpListenerSupported);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "获取系统信息时出错");
+            }
+            
+            // 0. 检查HttpListener是否受支持
+            if (!HttpListener.IsSupported)
+            {
+                LastErrorMessage = "当前操作系统不支持HttpListener，无法启动Web服务器";
+                _logger.LogError(LastErrorMessage);
+                return;
+            }
+            
+            // 1. 首先尝试绑定到所有网络接口 (需要管理员权限或URL保留)
+            try
+            {
+                bindingAttempts++;
+                _logger.LogInformation("尝试绑定到所有网络接口(方法1): http://+:{Port}/", Port);
+                
+                // 创建新的HttpListener实例
+                _httpListener = new HttpListener();
+                _httpListener.Prefixes.Add($"http://+:{Port}/");
+                
+                try
+                {
+                    _httpListener.Start();
+                    IsRunning = true;
+                    IsLocalOnly = false;
+                    bindingSuccess = true;
+                    LastErrorMessage = null;
+                    _logger.LogInformation("服务器已成功绑定到所有网络接口，应用程序可以通过内网访问");
+                    _logger.LogInformation("内网设备可以通过 http://{LocalIP}:{Port}/ 访问服务", GetLocalIPAddress(), Port);
+                    
+                    // 启动请求处理
+                    _cts = new CancellationTokenSource();
+                    _serverTask = HandleRequestsAsync(_cts.Token);
+                    return;
+                }
+                catch (HttpListenerException ex)
+                {
+                    _logger.LogWarning(ex, "无法绑定到所有网络接口，错误代码: {Code}, 错误信息: {Message}", ex.ErrorCode, ex.Message);
+                    _logger.LogWarning("这通常是因为没有管理员权限或未配置URL保留");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "创建HTTP监听器(方法1)时出错: {Message}", ex.Message);
+            }
+            
+            // 2. 尝试绑定到特定IP (不需要管理员权限)
+            if (!bindingSuccess)
+            {
+                try
+                {
+                    bindingAttempts++;
+                    _logger.LogInformation("尝试绑定到特定内网IP(方法2)...");
+                    
+                    // 释放之前的实例
+                    try
+                    {
+                        if (_httpListener != null)
+                        {
+                            _httpListener.Close();
+                            _httpListener = null;
+                        }
+                    }
+                    catch { }
+                    
+                    // 创建新的HttpListener实例
+                    _httpListener = new HttpListener();
+                    
+                    // 获取所有可能的本地IP地址
+                    var localIPs = GetAllLocalIPAddresses();
+                    _logger.LogInformation("检测到的所有本地IP: {IPs}", string.Join(", ", localIPs));
+                    
+                    if (localIPs.Count > 0)
+                    {
+                        bool anyIpSuccess = false;
+                        
+                        // 尝试每个IP地址
+                        foreach (var ip in localIPs)
+                        {
+                            try
+                            {
+                                string prefix = $"http://{ip}:{Port}/";
+                                _logger.LogInformation("尝试绑定到IP: {IP}", prefix);
+                                
+                                // 释放之前的实例
+                                try
+                                {
+                                    if (_httpListener != null)
+                                    {
+                                        _httpListener.Close();
+                                        _httpListener = null;
+                                    }
+                                }
+                                catch { }
+                                
+                                _httpListener = new HttpListener();
+                                _httpListener.Prefixes.Clear();
+                                _httpListener.Prefixes.Add(prefix);
+                                
+                                _httpListener.Start();
+                                IsRunning = true;
+                                IsLocalOnly = false;
+                                bindingSuccess = true;
+                                anyIpSuccess = true;
+                                LastErrorMessage = null;
+                                _logger.LogInformation("服务器已成功绑定到IP: {Prefix}", prefix);
+                                
+                                // 启动请求处理
+                                _cts = new CancellationTokenSource();
+                                _serverTask = HandleRequestsAsync(_cts.Token);
+                                break;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "绑定到IP {IP} 失败: {Message}", ip, ex.Message);
+                            }
+                        }
+                        
+                        if (anyIpSuccess)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogWarning("未找到有效的本地IP地址，将尝试本地模式");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "配置特定IP绑定失败(方法2): {Message}", ex.Message);
+                }
+            }
+            
+            // 3. 尝试本地回环地址 127.0.0.1
+            if (!bindingSuccess)
+            {
+                try
+                {
+                    bindingAttempts++;
+                    _logger.LogInformation("尝试绑定到127.0.0.1 (方法3): http://127.0.0.1:{Port}/", Port);
+                    
+                    // 释放之前的实例
+                    try
+                    {
+                        if (_httpListener != null)
+                        {
+                            _httpListener.Close();
+                            _httpListener = null;
+                        }
+                    }
+                    catch { }
+                    
+                    // 创建新的HttpListener实例
+                    _httpListener = new HttpListener();
+                    _httpListener.Prefixes.Clear();
+                    _httpListener.Prefixes.Add($"http://127.0.0.1:{Port}/");
+                    
+                    try
+                    {
+                        _httpListener.Start();
+                        IsRunning = true;
+                        IsLocalOnly = true;
+                        bindingSuccess = true;
+                        LastErrorMessage = null;
+                        _logger.LogInformation("服务器已成功绑定到127.0.0.1");
+                        
+                        // 启动请求处理
+                        _cts = new CancellationTokenSource();
+                        _serverTask = HandleRequestsAsync(_cts.Token);
+                        return;
+                    }
+                    catch (HttpListenerException ex)
+                    {
+                        _logger.LogWarning(ex, "无法绑定到127.0.0.1, 错误代码: {Code}", ex.ErrorCode);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "创建HTTP监听器(方法3)时出错");
+                }
+            }
+            
+            // 所有方法都失败
+            if (!bindingSuccess)
+            {
+                IsRunning = false;
+                LastErrorMessage = $"在尝试了{bindingAttempts}种绑定方法后，服务器仍无法启动。可能的原因：1) 防火墙阻止 2) 端口被占用 3) 网络接口不可用";
+                _logger.LogError(LastErrorMessage);
+                _logger.LogError("请尝试：1) 暂时关闭防火墙 2) 运行fix_netsh.bat 3) 重启计算机");
             }
         }
 
@@ -310,10 +483,23 @@ namespace ClassIsland.Services
             _logger.LogInformation("正在停止Web消息服务器...");
             try
             {
-                // 首先取消任务
+                // 首先取消所有任务
                 if (_cts != null && !_cts.IsCancellationRequested)
                 {
                     _cts.Cancel();
+                }
+                
+                // 等待监控任务完成
+                if (_monitorTask != null)
+                {
+                    try
+                    {
+                        await Task.WhenAny(_monitorTask, Task.Delay(3000));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "等待监控任务完成时出错");
+                    }
                 }
                 
                 // 然后停止监听器
@@ -424,15 +610,23 @@ namespace ClassIsland.Services
                             }
 
                             // 处理GET请求（返回HTML页面）
-                            if (request.HttpMethod == "GET" && (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/index.html"))
+                            if (request.HttpMethod == "GET")
                             {
-                                var html = GenerateHtmlPage();
-                                var buffer = Encoding.UTF8.GetBytes(html);
-                                response.ContentType = "text/html; charset=utf-8";
-                                response.ContentLength64 = buffer.Length;
-                                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                                response.Close();
-                                continue;
+                                if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/index.html")
+                                {
+                                    var html = GenerateHtmlPage();
+                                    var buffer = Encoding.UTF8.GetBytes(html);
+                                    response.ContentType = "text/html; charset=utf-8";
+                                    response.ContentLength64 = buffer.Length;
+                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                                    response.Close();
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/schedule")
+                                {
+                                    await HandleScheduleRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求（处理消息发送）
@@ -578,143 +772,355 @@ namespace ClassIsland.Services
 
         private string GenerateHtmlPage()
         {
-            // 使用标准HTML结构而不是原始字符串
             return @"<!DOCTYPE html>
 <html lang='zh-CN'>
 <head>
     <meta charset='UTF-8'>
     <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-    <title>ClassIsland自定义提醒发送</title>
+    <title>ClassIsland课程助手</title>
     <style>
-        body {
-            font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
+        :root {
+            --primary-color: #1976D2;
+            --secondary-color: #2196F3;
+            --background-color: #f8f9fa;
+            --card-background: #ffffff;
+            --text-color: #333333;
+            --border-radius: 12px;
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --transition: all 0.3s ease;
         }
-        .container {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2196F3;
-            margin-top: 0;
-        }
-        label {
-            display: block;
-            margin-top: 15px;
-            font-weight: bold;
-        }
-        input, textarea {
-            width: 100%;
-            padding: 8px;
-            margin-top: 5px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
+
+        * {
+            margin: 0;
+            padding: 0;
             box-sizing: border-box;
         }
+
+        body {
+            font-family: 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 24px;
+        }
+
+        .header {
+            grid-column: 1 / -1;
+            text-align: center;
+            margin-bottom: 32px;
+            padding: 24px;
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            border-radius: var(--border-radius);
+            color: white;
+            box-shadow: var(--shadow);
+        }
+
+        .header h1 {
+            font-size: 32px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        .header p {
+            font-size: 16px;
+            opacity: 0.9;
+        }
+
+        .card {
+            background: var(--card-background);
+            border-radius: var(--border-radius);
+            padding: 24px;
+            box-shadow: var(--shadow);
+            transition: var(--transition);
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .card h2 {
+            color: var(--primary-color);
+            margin-bottom: 20px;
+            font-size: 24px;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 10px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        input[type='text'],
+        input[type='number'],
         textarea {
-            min-height: 100px;
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: var(--transition);
+        }
+
+        input[type='text']:focus,
+        input[type='number']:focus,
+        textarea:focus {
+            border-color: var(--secondary-color);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.1);
+        }
+
+        textarea {
+            min-height: 120px;
             resize: vertical;
         }
+
         .checkbox-group {
-            margin-top: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 16px 0;
         }
+
         button {
-            background-color: #2196F3;
+            background-color: var(--primary-color);
             color: white;
             border: none;
-            padding: 10px 15px;
-            border-radius: 4px;
-            margin-top: 20px;
-            cursor: pointer;
+            padding: 12px 24px;
+            border-radius: 8px;
             font-size: 16px;
+            cursor: pointer;
+            transition: var(--transition);
+            width: 100%;
+            font-weight: 500;
         }
+
         button:hover {
-            background-color: #0b7dda;
+            background-color: var(--secondary-color);
+            transform: translateY(-2px);
         }
+
         #status {
-            margin-top: 20px;
-            padding: 10px;
-            border-radius: 4px;
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: 500;
             display: none;
         }
+
         .success {
-            background-color: #dff0d8;
-            color: #3c763d;
+            background-color: #e8f5e9;
+            color: #2e7d32;
+            border-left: 4px solid #2e7d32;
         }
+
         .error {
-            background-color: #f2dede;
-            color: #a94442;
+            background-color: #ffebee;
+            color: #c62828;
+            border-left: 4px solid #c62828;
+        }
+
+        .schedule {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 16px;
+            padding: 12px;
+            margin: 8px 0;
+            border-radius: 8px;
+            transition: var(--transition);
+        }
+
+        .schedule:hover {
+            background-color: #f5f5f5;
+        }
+
+        .schedule-time {
+            color: #666;
+            font-size: 14px;
+            font-weight: 500;
+            min-width: 120px;
+        }
+
+        .schedule-subject {
+            font-weight: 600;
+            color: var(--text-color);
+        }
+
+        .current-class {
+            background-color: #e3f2fd;
+            border-left: 4px solid var(--primary-color);
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+            
+            .card {
+                padding: 20px;
+            }
+            
+            .header {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid var(--primary-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-schedule {
+            text-align: center;
+            padding: 24px;
+            color: #666;
+            font-style: italic;
+            background-color: #f5f5f5;
+            border-radius: 8px;
+            margin: 16px 0;
         }
     </style>
 </head>
 <body>
     <div class='container'>
-        <h1>ClassIsland自定义提醒</h1>
-        <form id='reminderForm'>
-            <label for='message'>提醒内容:</label>
-            <textarea id='message' name='message' required></textarea>
-            
-            <div class='checkbox-group'>
-                <input type='checkbox' id='speech' name='speech'>
-                <label for='speech' style='display: inline'>启用语音朗读</label>
-            </div>
-            
-            <label for='duration'>显示时长(秒):</label>
-            <input type='number' id='duration' name='duration' value='10' min='1' max='60'>
-            
-            <button type='submit'>发送提醒</button>
-        </form>
+        <div class='header'>
+            <h1>ClassIsland 课程助手</h1>
+            <p>发送自定义提醒 & 实时课表查看</p>
+        </div>
         
-        <div id='status'></div>
+        <div class='card'>
+            <h2>📝 发送提醒</h2>
+            <form id='reminderForm'>
+                <div class='form-group'>
+                    <label for='message'>提醒内容</label>
+                    <textarea id='message' name='message' required placeholder='请输入要发送的提醒内容...'></textarea>
+                </div>
+                
+                <div class='checkbox-group'>
+                    <input type='checkbox' id='speech' name='speech'>
+                    <label for='speech'>启用语音朗读</label>
+                </div>
+                
+                <div class='form-group'>
+                    <label for='duration'>显示时长（秒）</label>
+                    <input type='number' id='duration' name='duration' value='10' min='1' max='60'>
+                </div>
+                
+                <button type='submit'>发送提醒</button>
+            </form>
+            <div id='status'></div>
+        </div>
+
+        <div class='card'>
+            <h2>📅 今日课表</h2>
+            <div id='schedule'></div>
+        </div>
     </div>
 
     <script>
-        document.getElementById('reminderForm').addEventListener('submit', function(e) {
+        document.getElementById('reminderForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            var message = document.getElementById('message').value;
-            var speech = document.getElementById('speech').checked;
-            var duration = document.getElementById('duration').value;
+            const message = document.getElementById('message').value;
+            const speech = document.getElementById('speech').checked;
+            const duration = document.getElementById('duration').value;
             
-            var data = {
-                message: message,
-                speech: speech,
-                duration: parseInt(duration)
-            };
-            
-            var statusDiv = document.getElementById('status');
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = '<div class=""loading""></div>正在发送...';
             statusDiv.className = '';
             statusDiv.style.display = 'block';
-            statusDiv.textContent = '正在发送...';
             
-            fetch('/', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(data)
-            })
-            .then(response => {
+            try {
+                const response = await fetch('/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message,
+                        speech,
+                        duration: parseInt(duration)
+                    })
+                });
+                
+                const data = await response.json();
+                
                 if (response.ok) {
-                    return response.json();
+                    statusDiv.className = 'success';
+                    statusDiv.textContent = '✅ 提醒已发送成功！';
+                    document.getElementById('message').value = '';
+                } else {
+                    throw new Error(data.error || '发送失败');
                 }
-                throw new Error('网络请求失败');
-            })
-            .then(data => {
-                statusDiv.className = 'success';
-                statusDiv.textContent = '提醒已发送成功！';
-                document.getElementById('message').value = '';
-            })
-            .catch(error => {
+            } catch (error) {
                 statusDiv.className = 'error';
-                statusDiv.textContent = '发送失败: ' + error.message;
-            });
+                statusDiv.textContent = '❌ ' + (error.message || '网络请求失败');
+            }
         });
+
+        async function fetchSchedule() {
+            const scheduleDiv = document.getElementById('schedule');
+            
+            try {
+                const response = await fetch('/api/schedule');
+                const data = await response.json();
+                
+                if (data.error) {
+                    scheduleDiv.innerHTML = `<div class=""empty-schedule"">⚠️ ${data.error}</div>`;
+                    return;
+                }
+                
+                if (data.classes && data.classes.length > 0) {
+                    const scheduleHtml = data.classes.map(lesson => `
+                        <div class='schedule ${lesson.isCurrent ? 'current-class' : ''}'>
+                            <div class='schedule-time'>${lesson.startTime} - ${lesson.endTime}</div>
+                            <div class='schedule-subject'>${lesson.subject}</div>
+                        </div>
+                    `).join('');
+                    scheduleDiv.innerHTML = scheduleHtml;
+                } else {
+                    scheduleDiv.innerHTML = '<div class=""empty-schedule"">📚 今日没有课程安排</div>';
+                }
+            } catch (error) {
+                scheduleDiv.innerHTML = '<div class=""empty-schedule"">❌ 获取课表失败</div>';
+            }
+        }
+
+        // 页面加载时获取课表
+        fetchSchedule();
+        // 每分钟刷新一次课表
+        setInterval(fetchSchedule, 60000);
     </script>
 </body>
 </html>";
@@ -802,330 +1208,10 @@ namespace ClassIsland.Services
                 throw;
             }
         }
-        
-        /// <summary>
-        /// 尝试多种方式绑定服务器地址
-        /// </summary>
-        private void TryBindToAddress()
-        {
-            bool bindingSuccess = false;
-            int bindingAttempts = 0;
-            
-            _logger.LogInformation("开始尝试绑定Web服务器...");
-            
-            // 检查管理员权限
-            var isAdmin = IsRunAsAdministrator();
-            _logger.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);
-            
-            // 记录系统信息
-            try
-            {
-                string osVersion = Environment.OSVersion.ToString();
-                string httpListenerSupported = HttpListener.IsSupported.ToString();
-                _logger.LogInformation("操作系统版本: {OSVersion}", osVersion);
-                _logger.LogInformation("系统是否支持HttpListener: {Supported}", httpListenerSupported);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "获取系统信息时出错");
-            }
-            
-            // 0. 检查HttpListener是否受支持
-            if (!HttpListener.IsSupported)
-            {
-                LastErrorMessage = "当前操作系统不支持HttpListener，无法启动Web服务器";
-                _logger.LogError(LastErrorMessage);
-                return;
-            }
-            
-            // 1. 首先尝试绑定到所有网络接口 (需要管理员权限或URL保留)
-            try
-            {
-                bindingAttempts++;
-                _logger.LogInformation("尝试绑定到所有网络接口(方法1): http://+:{Port}/", Port);
-                
-                // 创建新的HttpListener实例
-                _httpListener = new HttpListener();
-                _httpListener.Prefixes.Add($"http://+:{Port}/");
-                
-                try
-                {
-                    _httpListener.Start();
-                    IsRunning = true;
-                    IsLocalOnly = false;
-                    bindingSuccess = true;
-                    LastErrorMessage = null;
-                    _logger.LogInformation("服务器已成功绑定到所有网络接口，应用程序可以通过内网访问");
-                    _logger.LogInformation("内网设备可以通过 http://{LocalIP}:{Port}/ 访问服务", GetLocalIPAddress(), Port);
-                    
-                    // 启动请求处理
-                    _cts = new CancellationTokenSource();
-                    _serverTask = HandleRequestsAsync(_cts.Token);
-                    return;
-                }
-                catch (HttpListenerException ex)
-                {
-                    _logger.LogWarning(ex, "无法绑定到所有网络接口，错误代码: {Code}, 错误信息: {Message}", ex.ErrorCode, ex.Message);
-                    _logger.LogWarning("这通常是因为没有管理员权限或未配置URL保留");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "创建HTTP监听器(方法1)时出错: {Message}", ex.Message);
-            }
-            
-            // 2. 尝试绑定到0.0.0.0 (另一种方式绑定所有接口)
-            if (!bindingSuccess)
-            {
-                try
-                {
-                    bindingAttempts++;
-                    _logger.LogInformation("尝试绑定到0.0.0.0 (方法2): http://0.0.0.0:{Port}/", Port);
-                    
-                    // 释放之前的实例
-                    try
-                    {
-                        if (_httpListener != null)
-                        {
-                            _httpListener.Close();
-                            _httpListener = null;
-                        }
-                    }
-                    catch { }
-                    
-                    // 创建新的HttpListener实例
-                    _httpListener = new HttpListener();
-                    _httpListener.Prefixes.Add($"http://0.0.0.0:{Port}/");
-                    
-                    try
-                    {
-                        _httpListener.Start();
-                        IsRunning = true;
-                        IsLocalOnly = false;
-                        bindingSuccess = true;
-                        LastErrorMessage = null;
-                        _logger.LogInformation("服务器已成功绑定到0.0.0.0，应用程序可以通过内网访问");
-                        
-                        // 启动请求处理
-                        _cts = new CancellationTokenSource();
-                        _serverTask = HandleRequestsAsync(_cts.Token);
-                        return;
-                    }
-                    catch (HttpListenerException ex)
-                    {
-                        _logger.LogWarning(ex, "无法绑定到0.0.0.0, 错误代码: {Code}, 错误信息: {Message}", ex.ErrorCode, ex.Message);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "创建HTTP监听器(方法2)时出错: {Message}", ex.Message);
-                }
-            }
-            
-            // 3. 尝试绑定到特定IP (不需要管理员权限)
-            if (!bindingSuccess)
-            {
-                try
-                {
-                    bindingAttempts++;
-                    _logger.LogInformation("尝试绑定到特定内网IP(方法3)...");
-                    
-                    // 释放之前的实例
-                    try
-                    {
-                        if (_httpListener != null)
-                        {
-                            _httpListener.Close();
-                            _httpListener = null;
-                        }
-                    }
-                    catch { }
-                    
-                    // 创建新的HttpListener实例
-                    _httpListener = new HttpListener();
-                    
-                    // 获取所有可能的本地IP地址
-                    var localIPs = GetAllLocalIPAddresses();
-                    _logger.LogInformation("检测到的所有本地IP: {IPs}", string.Join(", ", localIPs));
-                    
-                    if (localIPs.Count > 0)
-                    {
-                        bool anyIpSuccess = false;
-                        
-                        // 尝试每个IP地址
-                        foreach (var ip in localIPs)
-                        {
-                            try
-                            {
-                                string prefix = $"http://{ip}:{Port}/";
-                                _logger.LogInformation("尝试绑定到IP: {IP}", prefix);
-                                
-                                // 释放之前的实例
-                                try
-                                {
-                                    if (_httpListener != null)
-                                    {
-                                        _httpListener.Close();
-                                        _httpListener = null;
-                                    }
-                                }
-                                catch { }
-                                
-                                _httpListener = new HttpListener();
-                                _httpListener.Prefixes.Clear();
-                                _httpListener.Prefixes.Add(prefix);
-                                
-                                _httpListener.Start();
-                                IsRunning = true;
-                                IsLocalOnly = false;
-                                bindingSuccess = true;
-                                anyIpSuccess = true;
-                                LastErrorMessage = null;
-                                _logger.LogInformation("服务器已成功绑定到IP: {Prefix}", prefix);
-                                
-                                // 启动请求处理
-                                _cts = new CancellationTokenSource();
-                                _serverTask = HandleRequestsAsync(_cts.Token);
-                                break;
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex, "绑定到IP {IP} 失败: {Message}", ip, ex.Message);
-                            }
-                        }
-                        
-                        if (anyIpSuccess)
-                        {
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogWarning("未找到有效的本地IP地址，将尝试本地模式");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "配置特定IP绑定失败(方法3): {Message}", ex.Message);
-                }
-            }
-            
-            // 4. 尝试使用备用端口绑定localhost
-            if (!bindingSuccess)
-            {
-                int[] alternativePorts = { 8089, 8090, 5000, 3000, 9000, 8000 };
-                
-                foreach (int altPort in alternativePorts)
-                {
-                    try
-                    {
-                        bindingAttempts++;
-                        _logger.LogInformation("尝试使用备用端口绑定到localhost(方法4): http://localhost:{Port}/", altPort);
-                        
-                        // 释放之前的实例
-                        try
-                        {
-                            if (_httpListener != null)
-                            {
-                                _httpListener.Close();
-                                _httpListener = null;
-                            }
-                        }
-                        catch { }
-                        
-                        // 创建新的HttpListener实例
-                        _httpListener = new HttpListener();
-                        _httpListener.Prefixes.Clear();
-                        _httpListener.Prefixes.Add($"http://localhost:{altPort}/");
-                        
-                        try
-                        {
-                            _httpListener.Start();
-                            IsRunning = true;
-                            IsLocalOnly = true;
-                            bindingSuccess = true;
-                            LastErrorMessage = null;
-                            Port = altPort; // 更新端口
-                            _logger.LogInformation("服务器已成功绑定到localhost，使用备用端口: {Port}", altPort);
-                            _logger.LogWarning("服务器当前仅限本机访问。要启用内网访问，请运行fix_netsh.bat脚本");
-                            
-                            // 启动请求处理
-                            _cts = new CancellationTokenSource();
-                            _serverTask = HandleRequestsAsync(_cts.Token);
-                            return;
-                        }
-                        catch (HttpListenerException ex)
-                        {
-                            _logger.LogWarning(ex, "无法绑定到localhost:{Port}, 错误代码: {Code}", altPort, ex.ErrorCode);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "尝试绑定到localhost:{Port}时出错", altPort);
-                    }
-                }
-            }
-            
-            // 5. 最后的尝试：本地回环地址 127.0.0.1
-            if (!bindingSuccess)
-            {
-                try
-                {
-                    bindingAttempts++;
-                    _logger.LogInformation("尝试绑定到127.0.0.1 (方法5): http://127.0.0.1:{Port}/", Port);
-                    
-                    // 释放之前的实例
-                    try
-                    {
-                        if (_httpListener != null)
-                        {
-                            _httpListener.Close();
-                            _httpListener = null;
-                        }
-                    }
-                    catch { }
-                    
-                    // 创建新的HttpListener实例
-                    _httpListener = new HttpListener();
-                    _httpListener.Prefixes.Clear();
-                    _httpListener.Prefixes.Add($"http://127.0.0.1:{Port}/");
-                    
-                    try
-                    {
-                        _httpListener.Start();
-                        IsRunning = true;
-                        IsLocalOnly = true;
-                        bindingSuccess = true;
-                        LastErrorMessage = null;
-                        _logger.LogInformation("服务器已成功绑定到127.0.0.1");
-                        
-                        // 启动请求处理
-                        _cts = new CancellationTokenSource();
-                        _serverTask = HandleRequestsAsync(_cts.Token);
-                        return;
-                    }
-                    catch (HttpListenerException ex)
-                    {
-                        _logger.LogWarning(ex, "无法绑定到127.0.0.1, 错误代码: {Code}", ex.ErrorCode);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "创建HTTP监听器(方法5)时出错");
-                }
-            }
-            
-            // 所有方法都失败
-            if (!bindingSuccess)
-            {
-                IsRunning = false;
-                LastErrorMessage = $"在尝试了{bindingAttempts}种绑定方法后，服务器仍无法启动。可能的原因：1) 防火墙阻止 2) 端口被占用 3) 网络接口不可用";
-                _logger.LogError(LastErrorMessage);
-                _logger.LogError("请尝试：1) 暂时关闭防火墙 2) 运行fix_netsh.bat 3) 重启计算机");
-            }
-        }
 
-        // 获取所有本地IP地址的方法
+        /// <summary>
+        /// 获取所有本地IP地址的方法
+        /// </summary>
         private List<string> GetAllLocalIPAddresses()
         {
             var result = new List<string>();
@@ -1271,6 +1357,72 @@ namespace ClassIsland.Services
             {
                 _logger.LogWarning(ex, $"测试端口 {portToUse} 时出错");
                 return -1;
+            }
+        }
+
+        private async Task HandleScheduleRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                if (_lessonsService == null)
+                {
+                    await WriteJsonResponse(response, new { error = "课表服务不可用" });
+                    return;
+                }
+
+                if (!_lessonsService.IsClassPlanLoaded)
+                {
+                    await WriteJsonResponse(response, new { error = "未加载课表" });
+                    return;
+                }
+
+                var currentPlan = _lessonsService.CurrentClassPlan;
+                if (currentPlan == null)
+                {
+                    await WriteJsonResponse(response, new { error = "当前没有课表" });
+                    return;
+                }
+
+                var currentTime = DateTime.Now.TimeOfDay;
+                var currentIndex = _lessonsService.CurrentSelectedIndex;
+                var currentTimeLayoutItem = _lessonsService.CurrentTimeLayoutItem;
+                var currentSubject = _lessonsService.CurrentSubject;
+
+                // 获取所有课程时间段
+                var classes = new List<object>();
+
+                // 添加当前课程
+                if (currentTimeLayoutItem != null && currentSubject != null)
+                {
+                    classes.Add(new
+                    {
+                        startTime = currentTimeLayoutItem.StartSecond.ToString(@"hh\:mm"),
+                        endTime = currentTimeLayoutItem.EndSecond.ToString(@"hh\:mm"),
+                        subject = currentSubject.Name ?? "未安排课程",
+                        isCurrent = true
+                    });
+                }
+
+                // 添加下一节课
+                var nextClassTimeLayoutItem = _lessonsService.NextClassTimeLayoutItem;
+                var nextClassSubject = _lessonsService.NextClassSubject;
+                if (nextClassTimeLayoutItem != null && nextClassSubject != null)
+                {
+                    classes.Add(new
+                    {
+                        startTime = nextClassTimeLayoutItem.StartSecond.ToString(@"hh\:mm"),
+                        endTime = nextClassTimeLayoutItem.EndSecond.ToString(@"hh\:mm"),
+                        subject = nextClassSubject.Name ?? "未安排课程",
+                        isCurrent = false
+                    });
+                }
+
+                await WriteJsonResponse(response, new { classes });
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "获取课表信息时出错");
+                await WriteJsonResponse(response, new { error = "获取课表失败" });
             }
         }
     }

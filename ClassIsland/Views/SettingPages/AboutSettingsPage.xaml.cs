@@ -164,6 +164,18 @@ public partial class AboutSettingsPage : SettingsPageBase
         }.ShowDialog();
     }
 
+    private void Hyperlink_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Hyperlink hyperlink && hyperlink.Tag is string url)
+        {
+            Process.Start(new ProcessStartInfo()
+            {
+                FileName = url,
+                UseShellExecute = true
+            });
+        }
+    }
+
     private async void Sayings_OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (ViewModel.IsSayingBusy)

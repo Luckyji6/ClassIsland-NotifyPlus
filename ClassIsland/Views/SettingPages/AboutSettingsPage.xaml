@@ -9,7 +9,6 @@
       xmlns:ci="clr-namespace:ClassIsland"
       xmlns:controls1="clr-namespace:ClassIsland.Core.Controls;assembly=ClassIsland.Core"
       xmlns:models="clr-namespace:ClassIsland.Models"
-      xmlns:commands="http://classisland.tech/schemas/xaml/core"
       xmlns:controls2="clr-namespace:ClassIsland.Controls"
       mc:Ignorable="d" 
       d:DesignHeight="450" d:DesignWidth="800"
@@ -125,10 +124,9 @@
                                        VerticalAlignment="Center" FontSize="14"
                                        TextWrapping="Wrap" 
                                        Visibility="{Binding IsSelected, RelativeSource={RelativeSource FindAncestor, AncestorType=ListBoxItem}, Converter={StaticResource BooleanToVisibilityConverter}}">
-                                <commands:NavHyperlink CommandParameter="{Binding Website}"
-                                                       ToolTip="{Binding Website}">
+                                <Hyperlink Click="Hyperlink2_OnClick">
                                     网站…
-                                </commands:NavHyperlink>
+                                </Hyperlink>
                             </TextBlock>
                             <!--<TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Description}"  Margin="0 3 0 0" TextWrapping="Wrap"/>-->
                         </Grid>
@@ -266,56 +264,44 @@
 
             <materialDesign:Card Margin="0 12 0 0" ClipContent="True">
                 <StackPanel Style="{StaticResource LinkButtonGroupStackPanelStyle}">
-                    <Button Command="{x:Static commands:UriNavigationCommands.UriNavigationCommand}"
-                            CommandParameter="https://classisland.tech">
-                        <Grid>
+                    <TextBlock Margin="16,8">
+                        <Hyperlink Click="Hyperlink_OnClick" Tag="https://classisland.tech">
                             <TextBlock Text="项目主页" />
-                            <materialDesign:PackIcon Kind="ExternalLink" HorizontalAlignment="Right"
-                                                     VerticalAlignment="Center"/>
-                        </Grid>
-                    </Button>
+                        </Hyperlink>
+                    </TextBlock>
                     <Separator Margin="0 -0.5" Opacity="0.5"/>
-                    <Button Command="{x:Static commands:UriNavigationCommands.UriNavigationCommand}"
-                            CommandParameter="https://github.com/ClassIsland/ClassIsland">
-                        <Grid>
+                    <TextBlock Margin="16,8">
+                        <Hyperlink Click="Hyperlink_OnClick" Tag="https://github.com/ClassIsland">
                             <TextBlock Text="GitHub" />
-                            <materialDesign:PackIcon Kind="ExternalLink" HorizontalAlignment="Right"
-                                                     VerticalAlignment="Center"/>
-                        </Grid>
-                    </Button>
+                        </Hyperlink>
+                    </TextBlock>
                     <Separator Margin="0 -0.5" Opacity="0.5"/>
-                    <Button Command="{x:Static commands:UriNavigationCommands.UriNavigationCommand}"
-                            CommandParameter="https://docs.classisland.tech/community/">
-                        <Grid>
-                            <TextBlock Text="加入社区" />
-                            <materialDesign:PackIcon Kind="ExternalLink" HorizontalAlignment="Right"
-                                                     VerticalAlignment="Center"/>
-                        </Grid>
-                    </Button>
+                    <TextBlock Margin="16,8">
+                        <Hyperlink Click="Hyperlink_OnClick" Tag="https://github.com/ClassIsland/ClassIsland/issues">
+                            <TextBlock Text="反馈问题" />
+                        </Hyperlink>
+                    </TextBlock>
                 </StackPanel>
             </materialDesign:Card>
 
             <materialDesign:Card Margin="0 12 0 0" ClipContent="True">
                 <StackPanel Style="{StaticResource LinkButtonGroupStackPanelStyle}">
-                    
-                    <Button Command="{x:Static commands:UriNavigationCommands.UriNavigationCommand}"
-                            CommandParameter="https://github.com/ClassIsland/ClassIsland/issues/">
-                        <Grid>
-                            <TextBlock Text="问题反馈/功能建议" />
-                            <materialDesign:PackIcon Kind="ExternalLink" HorizontalAlignment="Right"
-                                                     VerticalAlignment="Center"/>
-                        </Grid>
-                    </Button>
-                    <Separator Margin="0 -0.5" Opacity="0.5"/>
-                    <Button Command="{x:Static commands:UriNavigationCommands.UriNavigationCommand}"
-                            CommandParameter="https://github.com/ClassIsland/voting/discussions/categories/classisland?discussions_q=is%3Aopen+category%3AClassIsland+sort%3Atop">
-                        <Grid>
+                    <TextBlock Margin="16,8">
+                        <Hyperlink Click="Hyperlink_OnClick" Tag="https://github.com/ClassIsland/voting/discussions/categories/classisland?discussions_q=is%3Aopen+category%3AClassIsland+sort%3Atop">
                             <TextBlock Text="功能投票" />
-                            <materialDesign:PackIcon Kind="ExternalLink" HorizontalAlignment="Right"
-                                                     VerticalAlignment="Center"/>
-                        </Grid>
-                    </Button>
+                        </Hyperlink>
+                    </TextBlock>
                     <Separator Margin="0 -0.5" Opacity="0.5"/>
+                    <TextBlock Margin="16,8">
+                        <Hyperlink Click="Hyperlink_OnClick" Tag="https://docs.classisland.tech">
+                            <TextBlock Text="文档" />
+                        </Hyperlink>
+                    </TextBlock>
+                </StackPanel>
+            </materialDesign:Card>
+
+            <materialDesign:Card Margin="0 12 0 0" ClipContent="True">
+                <StackPanel Style="{StaticResource LinkButtonGroupStackPanelStyle}">
                     <Button Click="ButtonDiagnosticInfo_OnClick"
                             Command="{x:Static materialDesign:DialogHost.OpenDialogCommand}"
                             CommandParameter="{StaticResource DiagnosticInfoDialog}">
@@ -358,7 +344,7 @@
                         界面主题和部分控件使用了 MaterialDesignInXamlToolkit 框架。<LineBreak/>
                         应用字体使用了华为出品的 HarmonyOS Sans。<LineBreak/>
                         感谢协助本应用测试的同学。<LineBreak/>
-                        感谢<commands:NavHyperlink CommandParameter="https://www.jiangyin14.top/">姜胤</commands:NavHyperlink>和<commands:NavHyperlink CommandParameter="https://xiaowuap.com/">吴恩泽</commands:NavHyperlink>为本项目提供的服务器资源。<LineBreak/>
+                        感谢<Hyperlink Click="Hyperlink_OnClick" Tag="https://www.jiangyin14.top/">姜胤</Hyperlink>和<Hyperlink Click="Hyperlink_OnClick" Tag="https://xiaowuap.com/">吴恩泽</Hyperlink>为本项目提供的服务器资源。<LineBreak/>
                         天气数据来源于小米天气。<LineBreak/>
                         部分图像资源（/Assets/HoYoStickers/*）来自米游社和 Bilibili 装扮表情包，版权归 miHoYo 所有。<LineBreak/>
                         感谢其他使用的第三方库和贡献成员，详见贡献名单和第三方库。
