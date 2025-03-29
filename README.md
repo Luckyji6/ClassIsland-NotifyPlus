@@ -29,7 +29,50 @@
 ### 远程消息发送
 - 网页地址地址：`http://<本机IP>:8088`
 注意：本网站只能在内网访问
+ClassIsland 目前支持以下 Web API 请求：
 
+1. **发送自定义消息**
+   - **端点**: `http://[IP地址]:8088/api/message` 或直接 `http://[IP地址]:8088/`
+   - **方法**: POST
+   - **内容类型**: application/json
+   - **请求体格式**:
+     ```json
+     {
+       "message": "要显示的消息内容",
+       "speech": true,  // 可选，是否语音朗读
+       "duration": 10   // 可选，显示时长(秒)
+     }
+     ```
+   - **响应**:
+     ```json
+     {
+       "success": true|false,
+       "error": "错误信息"    // 如果出错才会有
+     }
+     ```
+
+2. **获取课表信息**
+   - **端点**: `http://[IP地址]:8088/api/schedule`
+   - **方法**: GET
+   - **响应**:
+     ```json
+     {
+       "classes": [
+         {
+           "startTime": "开始时间 (hh:mm)",
+           "endTime": "结束时间 (hh:mm)",
+           "subject": "课程名称",
+           "isCurrent": true|false  // 是否为当前课程
+         },
+         // 可能包含下一节课
+       ]
+     }
+     ```
+     或者出错时:
+     ```json
+     {
+       "error": "错误信息"
+     }
 
 ## ❓ 常见问题
 
