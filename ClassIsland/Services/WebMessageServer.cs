@@ -636,14 +636,54 @@ namespace ClassIsland.Services
                                 continue;
                             }
 
-                            // 其他请求返回404
+                            // 特殊API路径处理
+                            if (request.Url.AbsolutePath == "/api/cnm")
+                            {
+                                response.StatusCode = 200;
+                                var specialBuffer = Encoding.UTF8.GetBytes("我也cnm");
+                                response.ContentType = "text/plain; charset=utf-8";
+                                response.ContentLength64 = specialBuffer.Length;
+                                await response.OutputStream.WriteAsync(specialBuffer, 0, specialBuffer.Length);
+                                response.Close();
+                                continue;
+                            }
+
+                            // 其他请求返回404，但附带API说明
                             response.StatusCode = 404;
                             response.StatusDescription = "Not Found";
-                            var notFoundBuffer = Encoding.UTF8.GetBytes("404 - Not Found");
-                            response.ContentType = "text/plain";
-                            response.ContentLength64 = notFoundBuffer.Length;
-                            await response.OutputStream.WriteAsync(notFoundBuffer, 0, notFoundBuffer.Length);
-                            response.Close();
+                            
+                            // 提供API信息而不是简单的404
+                            var apiDescription = new
+                            {
+                                error = "请求的端点不存在",
+                                message = "ClassIsland支持以下API请求：",
+                                api = new object[]
+                                {
+                                    new {
+                                        endpoint = "/api/message",
+                                        method = "POST",
+                                        description = "发送自定义消息",
+                                        example = new {
+                                            message = "要显示的消息内容",
+                                            speech = true,
+                                            duration = 10
+                                        }
+                                    },
+                                    new {
+                                        endpoint = "/api/schedule",
+                                        method = "GET",
+                                        description = "获取当前课表信息"
+                                    },
+                                    new {
+                                        endpoint = "/",
+                                        method = "GET",
+                                        description = "访问Web界面"
+                                    }
+                                }
+                            };
+                            
+                            // 返回JSON格式的API信息
+                            await WriteJsonResponse(response, apiDescription);
                         }
                         catch (Exception ex)
                         {
