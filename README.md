@@ -29,7 +29,7 @@
 ### 远程消息发送
 - 网页地址地址：`http://<本机IP>:8088`
 注意：本网站只能在内网访问
-ClassIsland 目前支持以下 Web API 请求：
+- ClassIsland 目前支持以下 Web API 请求：
 
 1. **发送自定义消息**
    - **端点**: `http://[IP地址]:8088/api/message` 或直接 `http://[IP地址]:8088/`
