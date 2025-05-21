@@ -502,6 +502,7 @@ public partial class App : AppBase, IAppHost
                 services.AddHostedService(provider => provider.GetRequiredService<CustomMessageNotificationProvider>());
                 // 添加Web消息服务器
                 services.AddSingleton<WebMessageServer>();
+                services.AddSingleton<MessageSecurityService>();
                 
                 // 记录管理员权限状态
                 var isAdmin = IsRunAsAdministrator();

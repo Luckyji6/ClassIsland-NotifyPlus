@@ -25,6 +25,7 @@ namespace ClassIsland.Services
         private readonly ILogger<WebMessageServer> _logger;
         private readonly CustomMessageNotificationProvider _notificationProvider;
         private readonly ILessonsService _lessonsService;
+        private readonly MessageSecurityService _securityService;
         private HttpListener? _httpListener;
         private CancellationTokenSource? _cts;
         private Task? _serverTask;
@@ -58,11 +59,13 @@ namespace ClassIsland.Services
         public WebMessageServer(
             ILogger<WebMessageServer> logger,
             CustomMessageNotificationProvider notificationProvider,
-            ILessonsService lessonsService)
+            ILessonsService lessonsService,
+            MessageSecurityService securityService)
         {
             _logger = logger;
             _notificationProvider = notificationProvider;
             _lessonsService = lessonsService;
+            _securityService = securityService;
             
             // 在构造函数中记录初始化信息
             _logger.LogInformation("WebMessageServer服务已创建，等待启动...");
@@ -614,7 +617,55 @@ namespace ClassIsland.Services
                             {
                                 if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/index.html")
                                 {
+                                    // 检查是否设置了令牌，如果未设置，重定向到设置页面
+                                    if (!_securityService.IsTokenConfigured)
+                                    {
+                                        response.StatusCode = 302; // 重定向
+                                        response.Headers.Add("Location", "/setup");
+                                        response.Close();
+                                        continue;
+                                    }
+                                    
+                                    // 检查是否已登录（通过cookie）
+                                    bool isAuthenticated = IsAuthenticated(request);
+                                    if (!isAuthenticated)
+                                    {
+                                        response.StatusCode = 302; // 重定向
+                                        response.Headers.Add("Location", "/login");
+                                        response.Close();
+                                        continue;
+                                    }
+                                    
                                     var html = GenerateHtmlPage();
+                                    var buffer = Encoding.UTF8.GetBytes(html);
+                                    response.ContentType = "text/html; charset=utf-8";
+                                    response.ContentLength64 = buffer.Length;
+                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                                    response.Close();
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/login")
+                                {
+                                    var html = GenerateLoginPage();
+                                    var buffer = Encoding.UTF8.GetBytes(html);
+                                    response.ContentType = "text/html; charset=utf-8";
+                                    response.ContentLength64 = buffer.Length;
+                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                                    response.Close();
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/setup")
+                                {
+                                    // 如果令牌已配置，重定向到登录页面
+                                    if (_securityService.IsTokenConfigured)
+                                    {
+                                        response.StatusCode = 302; // 重定向
+                                        response.Headers.Add("Location", "/login");
+                                        response.Close();
+                                        continue;
+                                    }
+                                    
+                                    var html = GenerateSetupPage();
                                     var buffer = Encoding.UTF8.GetBytes(html);
                                     response.ContentType = "text/html; charset=utf-8";
                                     response.ContentLength64 = buffer.Length;
@@ -624,16 +675,51 @@ namespace ClassIsland.Services
                                 }
                                 else if (request.Url.AbsolutePath == "/api/schedule")
                                 {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
                                     await HandleScheduleRequest(response);
                                     continue;
                                 }
                             }
 
-                            // 处理POST请求（处理消息发送）
-                            if (request.HttpMethod == "POST" && (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/api/message"))
+                            // 处理POST请求
+                            if (request.HttpMethod == "POST")
                             {
-                                await ProcessPostRequest(request, response);
-                                continue;
+                                if (request.Url.AbsolutePath == "/api/login")
+                                {
+                                    await HandleLoginRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/setup")
+                                {
+                                    await HandleSetupRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/api/message")
+                                {
+                                    // 获取客户端IP地址
+                                    string clientIp = request.RemoteEndPoint.ToString();
+                                    
+                                    // 验证Token
+                                    bool isAuthorized = await ValidateRequestToken(request);
+                                    if (!isAuthorized)
+                                    {
+                                        response.StatusCode = 401; // 未授权
+                                        await WriteJsonResponse(response, new { success = false, error = "未授权访问，请先登录并提供正确的访问令牌" });
+                                        
+                                        // 记录未授权访问
+                                        await _securityService.LogMessageHistoryAsync("未授权访问尝试", false, clientIp);
+                                        continue;
+                                    }
+                                    
+                                    await ProcessPostRequest(request, response);
+                                    continue;
+                                }
                             }
 
                             // 特殊API路径处理
@@ -750,6 +836,9 @@ namespace ClassIsland.Services
         {
             try
             {
+                // 获取客户端IP地址
+                string clientIp = request.RemoteEndPoint.ToString();
+                
                 // 读取请求体
                 string requestBody;
                 using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
@@ -765,6 +854,9 @@ namespace ClassIsland.Services
                     response.StatusCode = 400;
                     response.StatusDescription = "Bad Request";
                     await WriteJsonResponse(response, new { success = false, error = "缺少必要的消息内容" });
+                    
+                    // 记录失败日志
+                    await _securityService.LogMessageHistoryAsync("请求格式错误：缺少消息内容", false, clientIp);
                     return;
                 }
 
@@ -778,6 +870,7 @@ namespace ClassIsland.Services
                 _notificationProvider.Settings.UseSpeech = useSpeech;
                 _notificationProvider.Settings.DisplayDurationSeconds = displayDuration;
 
+                bool success = true;
                 try
                 {
                     // 触发消息显示
@@ -794,8 +887,12 @@ namespace ClassIsland.Services
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "显示自定义提醒时发生错误");
+                    success = false;
                     // 不抛出异常，继续处理响应
                 }
+
+                // 记录消息历史
+                await _securityService.LogMessageHistoryAsync(message, success, clientIp);
 
                 // 发送成功响应
                 _logger.LogInformation("已接收到Web消息请求: {Message}", message);
@@ -806,6 +903,10 @@ namespace ClassIsland.Services
                 _logger.LogError(ex, "处理POST请求时出错");
                 response.StatusCode = 500;
                 response.StatusDescription = "Internal Server Error";
+                
+                // 记录错误日志
+                await _securityService.LogMessageHistoryAsync("处理消息请求时服务器内部错误", false, request.RemoteEndPoint.ToString());
+                
                 await WriteJsonResponse(response, new { success = false, error = $"服务器内部错误: {ex.Message}" });
             }
         }
@@ -1464,6 +1565,688 @@ namespace ClassIsland.Services
                 _logger?.LogError(ex, "获取课表信息时出错");
                 await WriteJsonResponse(response, new { error = "获取课表失败" });
             }
+        }
+
+        private bool IsAuthenticated(HttpListenerRequest request)
+        {
+            try
+            {
+                // 检查Cookie中是否有认证令牌
+                var cookieCollection = request.Cookies;
+                if (cookieCollection != null)
+                {
+                    var authCookie = cookieCollection["ClassIslandAuth"];
+                    if (authCookie != null && !string.IsNullOrEmpty(authCookie.Value))
+                    {
+                        // 验证Cookie中的令牌
+                        return _securityService.ValidateToken(authCookie.Value);
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "验证认证状态时出错");
+                return false;
+            }
+        }
+
+        private async Task HandleLoginRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                // 读取请求体
+                string requestBody;
+                using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                {
+                    requestBody = await reader.ReadToEndAsync();
+                }
+
+                // 解析JSON数据
+                var data = JsonConvert.DeserializeObject<Dictionary<string, string>>(requestBody);
+                
+                if (data == null || !data.ContainsKey("token"))
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { success = false, error = "请提供访问令牌" });
+                    return;
+                }
+
+                string token = data["token"];
+                
+                // 验证令牌
+                if (_securityService.ValidateToken(token))
+                {
+                    // 设置认证Cookie
+                    var authCookie = new Cookie("ClassIslandAuth", token)
+                    {
+                        Path = "/",
+                        Expires = DateTime.Now.AddDays(7) // 7天过期
+                    };
+                    response.SetCookie(authCookie);
+                    
+                    await WriteJsonResponse(response, new { success = true });
+                    _logger.LogInformation("用户登录成功");
+                }
+                else
+                {
+                    response.StatusCode = 401;
+                    await WriteJsonResponse(response, new { success = false, error = "访问令牌无效" });
+                    _logger.LogWarning("用户登录失败：令牌无效");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理登录请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        private async Task HandleSetupRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                // 检查是否已配置令牌
+                if (_securityService.IsTokenConfigured)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { success = false, error = "访问令牌已配置，无法重新设置" });
+                    return;
+                }
+                
+                // 读取请求体
+                string requestBody;
+                using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                {
+                    requestBody = await reader.ReadToEndAsync();
+                }
+
+                // 解析JSON数据
+                var data = JsonConvert.DeserializeObject<Dictionary<string, string>>(requestBody);
+                
+                if (data == null)
+                {
+                    // 如果没有提供令牌，则生成一个新的
+                    string newToken = _securityService.GenerateToken();
+                    bool result = await _securityService.SetToken(newToken);
+                    
+                    if (result)
+                    {
+                        await WriteJsonResponse(response, new { success = true, token = newToken });
+                        _logger.LogInformation("已生成并设置新的访问令牌");
+                    }
+                    else
+                    {
+                        response.StatusCode = 500;
+                        await WriteJsonResponse(response, new { success = false, error = "设置访问令牌失败" });
+                    }
+                }
+                else if (data.ContainsKey("token") && !string.IsNullOrEmpty(data["token"]))
+                {
+                    // 使用提供的令牌
+                    string token = data["token"];
+                    bool result = await _securityService.SetToken(token);
+                    
+                    if (result)
+                    {
+                        await WriteJsonResponse(response, new { success = true });
+                        _logger.LogInformation("已设置用户提供的访问令牌");
+                    }
+                    else
+                    {
+                        response.StatusCode = 500;
+                        await WriteJsonResponse(response, new { success = false, error = "设置访问令牌失败" });
+                    }
+                }
+                else
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { success = false, error = "请求格式错误" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理设置请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        private async Task<bool> ValidateRequestToken(HttpListenerRequest request)
+        {
+            try
+            {
+                // 首先检查认证Cookie
+                if (IsAuthenticated(request))
+                {
+                    return true;
+                }
+                
+                // 如果Cookie验证失败，检查请求体中的令牌
+                if (request.HasEntityBody)
+                {
+                    string requestBody;
+                    using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                    {
+                        requestBody = await reader.ReadToEndAsync();
+                        // 重置输入流，以便后续处理可以再次读取
+                        request.InputStream.Position = 0;
+                    }
+
+                    var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(requestBody);
+                    if (data != null && data.ContainsKey("token") && data["token"] != null)
+                    {
+                        string token = data["token"].ToString();
+                        return _securityService.ValidateToken(token);
+                    }
+                }
+                
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "验证请求令牌时出错");
+                return false;
+            }
+        }
+
+        private string GenerateLoginPage()
+        {
+            return @"<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>登录 - ClassIsland课程助手</title>
+    <style>
+        :root {
+            --primary-color: #1976D2;
+            --secondary-color: #2196F3;
+            --background-color: #f8f9fa;
+            --card-background: #ffffff;
+            --text-color: #333333;
+            --border-radius: 12px;
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --transition: all 0.3s ease;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            max-width: 500px;
+            width: 100%;
+            background-color: var(--card-background);
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+            padding: 30px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            color: var(--primary-color);
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        p {
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        input[type='text'], input[type='password'] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            transition: var(--transition);
+        }
+
+        button:hover {
+            background-color: var(--secondary-color);
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .alert-error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <div class='header'>
+            <h1>登录</h1>
+            <p>请输入您的访问令牌以继续访问</p>
+        </div>
+        
+        <div id='loginError' class='alert alert-error'></div>
+        <div id='loginSuccess' class='alert alert-success'></div>
+        
+        <div class='form-group'>
+            <label for='tokenInput'>访问令牌</label>
+            <input type='text' id='tokenInput' placeholder='请输入访问令牌，格式：XXX-XXX'>
+        </div>
+        
+        <button id='loginButton'>登录</button>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const loginButton = document.getElementById('loginButton');
+            const tokenInput = document.getElementById('tokenInput');
+            const loginError = document.getElementById('loginError');
+            const loginSuccess = document.getElementById('loginSuccess');
+            
+            loginButton.addEventListener('click', async function() {
+                const token = tokenInput.value.trim();
+                
+                if (!token) {
+                    showError('请输入访问令牌');
+                    return;
+                }
+                
+                try {
+                    loginButton.disabled = true;
+                    loginButton.textContent = '登录中...';
+                    
+                    const response = await fetch('/api/login', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ token })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showSuccess('登录成功，正在跳转...');
+                        setTimeout(() => {
+                            window.location.href = '/';
+                        }, 1500);
+                    } else {
+                        showError(data.error || '登录失败，请检查您的访问令牌');
+                        loginButton.disabled = false;
+                        loginButton.textContent = '登录';
+                    }
+                } catch (error) {
+                    showError('登录请求失败，请稍后再试');
+                    loginButton.disabled = false;
+                    loginButton.textContent = '登录';
+                }
+            });
+            
+            // 移除自动格式化功能
+            
+            function showError(message) {
+                loginError.textContent = message;
+                loginError.style.display = 'block';
+                loginSuccess.style.display = 'none';
+            }
+            
+            function showSuccess(message) {
+                loginSuccess.textContent = message;
+                loginSuccess.style.display = 'block';
+                loginError.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>";
+        }
+
+        private string GenerateSetupPage()
+        {
+            return @"<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>设置访问令牌 - ClassIsland课程助手</title>
+    <style>
+        :root {
+            --primary-color: #1976D2;
+            --secondary-color: #2196F3;
+            --background-color: #f8f9fa;
+            --card-background: #ffffff;
+            --text-color: #333333;
+            --border-radius: 12px;
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --transition: all 0.3s ease;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            max-width: 600px;
+            width: 100%;
+            background-color: var(--card-background);
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+            padding: 30px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            color: var(--primary-color);
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        p {
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        input[type='text'] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            transition: var(--transition);
+            margin-bottom: 10px;
+        }
+
+        button:hover {
+            background-color: var(--secondary-color);
+        }
+
+        .token-display {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #f0f8ff;
+            border-radius: var(--border-radius);
+            border: 1px solid #c3e6cb;
+            display: none;
+        }
+
+        .token-value {
+            font-size: 1.2em;
+            font-weight: 600;
+            text-align: center;
+            margin-bottom: 15px;
+            word-break: break-all;
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .alert-error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .options {
+            display: flex;
+            gap: 10px;
+        }
+
+        .options button {
+            flex: 1;
+        }
+
+        .warning {
+            color: #856404;
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <div class='header'>
+            <h1>设置访问令牌</h1>
+            <p>首次使用前，请设置用于保护您消息服务的访问令牌</p>
+        </div>
+        
+        <div id='setupError' class='alert alert-error'></div>
+        <div id='setupSuccess' class='alert alert-success'></div>
+        
+        <div class='options'>
+            <button id='generateButton'>生成随机令牌（推荐）</button>
+            <button id='customButton'>使用自定义令牌</button>
+        </div>
+        
+        <div id='customTokenForm' class='form-group' style='display: none; margin-top: 20px;'>
+            <label for='tokenInput'>自定义令牌</label>
+            <input type='text' id='tokenInput' placeholder='请输入访问令牌，格式：XXX-XXX'>
+            <button id='setCustomTokenButton' style='margin-top: 10px;'>设置自定义令牌</button>
+        </div>
+        
+        <div id='tokenDisplay' class='token-display'>
+            <p>您的访问令牌为：</p>
+            <div id='tokenValue' class='token-value'></div>
+            <p style='text-align: center;'>请妥善保管此令牌，并确保只有授权人员知晓</p>
+            <button id='continueButton'>继续登录</button>
+        </div>
+        
+        <div class='warning'>
+            <p><strong>重要提示：</strong>令牌一旦设置将无法通过此界面更改。如需更改，请删除程序目录下的message文件夹中的security.dat文件。</p>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const generateButton = document.getElementById('generateButton');
+            const customButton = document.getElementById('customButton');
+            const customTokenForm = document.getElementById('customTokenForm');
+            const tokenInput = document.getElementById('tokenInput');
+            const setCustomTokenButton = document.getElementById('setCustomTokenButton');
+            const tokenDisplay = document.getElementById('tokenDisplay');
+            const tokenValue = document.getElementById('tokenValue');
+            const continueButton = document.getElementById('continueButton');
+            const setupError = document.getElementById('setupError');
+            const setupSuccess = document.getElementById('setupSuccess');
+            
+            generateButton.addEventListener('click', async function() {
+                try {
+                    generateButton.disabled = true;
+                    generateButton.textContent = '生成中...';
+                    
+                    const response = await fetch('/api/setup', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        tokenValue.textContent = data.token;
+                        tokenDisplay.style.display = 'block';
+                        showSuccess('令牌生成成功');
+                        generateButton.style.display = 'none';
+                        customButton.style.display = 'none';
+                    } else {
+                        showError(data.error || '生成令牌失败');
+                        generateButton.disabled = false;
+                        generateButton.textContent = '生成随机令牌';
+                    }
+                } catch (error) {
+                    showError('请求失败，请稍后再试');
+                    generateButton.disabled = false;
+                    generateButton.textContent = '生成随机令牌';
+                }
+            });
+            
+            customButton.addEventListener('click', function() {
+                customTokenForm.style.display = 'block';
+                generateButton.style.display = 'none';
+                customButton.style.display = 'none';
+            });
+            
+            setCustomTokenButton.addEventListener('click', async function() {
+                const token = tokenInput.value.trim();
+                
+                if (!token) {
+                    showError('请输入自定义令牌');
+                    return;
+                }
+                
+                try {
+                    setCustomTokenButton.disabled = true;
+                    setCustomTokenButton.textContent = '设置中...';
+                    
+                    const response = await fetch('/api/setup', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ token })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        tokenValue.textContent = token;
+                        tokenDisplay.style.display = 'block';
+                        customTokenForm.style.display = 'none';
+                        showSuccess('自定义令牌设置成功');
+                    }
+                    else {
+                        showError(data.error || '设置令牌失败');
+                        setCustomTokenButton.disabled = false;
+                        setCustomTokenButton.textContent = '设置自定义令牌';
+                    }
+                } catch (error) {
+                    showError('请求失败，请稍后再试');
+                    setCustomTokenButton.disabled = false;
+                    setCustomTokenButton.textContent = '设置自定义令牌';
+                }
+            });
+            
+            // 移除自动格式化功能
+            
+            continueButton.addEventListener('click', function() {
+                window.location.href = '/login';
+            });
+            
+            function showError(message) {
+                setupError.textContent = message;
+                setupError.style.display = 'block';
+                setupSuccess.style.display = 'none';
+            }
+            
+            function showSuccess(message) {
+                setupSuccess.textContent = message;
+                setupSuccess.style.display = 'block';
+                setupError.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>";
         }
     }
 } 
