@@ -14,6 +14,7 @@ using Newtonsoft.Json;
 using System.Linq;
 using ClassIsland.Core.Abstractions.Services;
 using ClassIsland.Core;
+using System.Web;
 
 namespace ClassIsland.Services
 {
@@ -26,6 +27,8 @@ namespace ClassIsland.Services
         private readonly CustomMessageNotificationProvider _notificationProvider;
         private readonly ILessonsService _lessonsService;
         private readonly MessageSecurityService _securityService;
+        private readonly ScheduleApiService _scheduleApiService;
+        private readonly ScreenshotService _screenshotService;
         private HttpListener? _httpListener;
         private CancellationTokenSource? _cts;
         private Task? _serverTask;
@@ -35,6 +38,7 @@ namespace ClassIsland.Services
         private int _retryCount = 0;
         private DateTime _lastErrorTime = DateTime.MinValue;
         private bool _isAppStarted = false;
+        private readonly IHostApplicationLifetime _hostApplicationLifetime;
 
         public bool IsRunning { get; private set; }
         
@@ -60,12 +64,18 @@ namespace ClassIsland.Services
             ILogger<WebMessageServer> logger,
             CustomMessageNotificationProvider notificationProvider,
             ILessonsService lessonsService,
-            MessageSecurityService securityService)
+            MessageSecurityService securityService,
+            ScheduleApiService scheduleApiService,
+            ScreenshotService screenshotService,
+            IHostApplicationLifetime hostApplicationLifetime)
         {
             _logger = logger;
             _notificationProvider = notificationProvider;
             _lessonsService = lessonsService;
             _securityService = securityService;
+            _scheduleApiService = scheduleApiService;
+            _screenshotService = screenshotService;
+            _hostApplicationLifetime = hostApplicationLifetime;
             
             // 在构造函数中记录初始化信息
             _logger.LogInformation("WebMessageServer服务已创建，等待启动...");
@@ -685,6 +695,32 @@ namespace ClassIsland.Services
                                     await HandleScheduleRequest(response);
                                     continue;
                                 }
+                                else if (request.Url.AbsolutePath.StartsWith("/api/screenshot"))
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleScreenshotRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/windows")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleWindowsListRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求
@@ -733,6 +769,21 @@ namespace ClassIsland.Services
                                 response.Close();
                                 continue;
                             }
+                            // 处理schedule-api路径请求
+                            else if (request.Url.AbsolutePath.StartsWith("/schedule-api/"))
+                            {
+                                // 检查是否已登录
+                                if (!IsAuthenticated(request))
+                                {
+                                    response.StatusCode = 401;
+                                    await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                    continue;
+                                }
+                                
+                                // 将请求转发到ScheduleApiRequest处理器
+                                await HandleScheduleApiRequest(request, response);
+                                continue;
+                            }
 
                             // 其他请求返回404，但附带API说明
                             response.StatusCode = 404;
@@ -759,6 +810,35 @@ namespace ClassIsland.Services
                                         endpoint = "/api/schedule",
                                         method = "GET",
                                         description = "获取当前课表信息"
+                                    },
+                                    new {
+                                        endpoint = "/api/screenshot",
+                                        method = "GET",
+                                        description = "获取屏幕截图（延迟3秒执行）",
+                                        parameters = new {
+                                            type = "截图类型：fullscreen(全屏)、window(指定窗口)",
+                                            windowHandle = "窗口句柄（可选，仅用于window类型，通过/api/windows获取）"
+                                        }
+                                    },
+                                    new {
+                                        endpoint = "/api/windows",
+                                        method = "GET",
+                                        description = "获取可截图的窗口列表"
+                                    },
+                                    new {
+                                        endpoint = "/schedule-api/schedule",
+                                        method = "GET",
+                                        description = "获取课表数据(排课系统API)"
+                                    },
+                                    new {
+                                        endpoint = "/schedule-api/timeLayout",
+                                        method = "GET",
+                                        description = "获取时间表数据(排课系统API)"
+                                    },
+                                    new {
+                                        endpoint = "/schedule-api/subjects",
+                                        method = "GET",
+                                        description = "获取科目列表(排课系统API)"
                                     },
                                     new {
                                         endpoint = "/",
@@ -1187,6 +1267,38 @@ namespace ClassIsland.Services
             <h2>📅 今日课表</h2>
             <div id='schedule'></div>
         </div>
+
+        <div class='card'>
+            <h2>📸 远程截图</h2>
+            <div class='form-group'>
+                <label for='screenshotType'>截图类型</label>
+                <select id='screenshotType' style='width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px;'>
+                    <option value='fullscreen'>全屏截图</option>
+                    <option value='window'>窗口截图</option>
+                </select>
+            </div>
+            
+            <div class='form-group' id='windowSelectGroup' style='display: none;'>
+                <label for='windowSelect'>选择窗口</label>
+                <div style='display: flex; gap: 10px; align-items: stretch;'>
+                    <select id='windowSelect' style='flex: 1; min-width: 0; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; box-sizing: border-box; max-width: calc(100% - 120px);'>
+                        <option value=''>请先刷新窗口列表</option>
+                    </select>
+                    <button type='button' id='refreshWindowsBtn' onclick='refreshWindows()' style='background: #2196F3; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 14px; cursor: pointer; white-space: nowrap; flex-shrink: 0; min-width: 100px;'>
+                        🔄 刷新
+                    </button>
+                </div>
+            </div>
+            
+            <div id='countdownDisplay' style='display: none; text-align: center; font-size: 18px; font-weight: bold; color: #FF6B6B; margin: 15px 0;'>
+                即将截图: <span id='countdownTimer'>3</span> 秒
+            </div>
+            
+            <button type='button' onclick='takeScreenshot()'>📸 截图（延迟3秒）</button>
+            
+            <div id='screenshotStatus' style='margin-top: 16px; display: none;'></div>
+            <div id='screenshotResult' style='margin-top: 16px;'></div>
+        </div>
     </div>
 
     <script>
@@ -1262,6 +1374,131 @@ namespace ClassIsland.Services
         fetchSchedule();
         // 每分钟刷新一次课表
         setInterval(fetchSchedule, 60000);
+
+        // 截图类型改变时显示/隐藏相关输入框
+        document.getElementById('screenshotType').addEventListener('change', function() {
+            const type = this.value;
+            const windowSelectGroup = document.getElementById('windowSelectGroup');
+            
+            if (type === 'window') {
+                windowSelectGroup.style.display = 'block';
+                refreshWindows(); // 自动刷新窗口列表
+            } else {
+                windowSelectGroup.style.display = 'none';
+            }
+        });
+
+        async function takeScreenshot() {
+            const statusDiv = document.getElementById('screenshotStatus');
+            const resultDiv = document.getElementById('screenshotResult');
+            const countdownDiv = document.getElementById('countdownDisplay');
+            const countdownTimer = document.getElementById('countdownTimer');
+            
+            statusDiv.innerHTML = '📸 准备截图...';
+            statusDiv.className = '';
+            statusDiv.style.display = 'block';
+            resultDiv.innerHTML = '';
+            
+            try {
+                const type = document.getElementById('screenshotType').value;
+                let windowHandle = '';
+                
+                if (type === 'window') {
+                    windowHandle = document.getElementById('windowSelect').value;
+                    if (!windowHandle) {
+                        throw new Error('请选择要截图的窗口');
+                    }
+                }
+                
+                // 显示倒计时
+                countdownDiv.style.display = 'block';
+                let count = 3;
+                countdownTimer.textContent = count;
+                
+                const countdownInterval = setInterval(() => {
+                    count--;
+                    if (count > 0) {
+                        countdownTimer.textContent = count;
+                    } else {
+                        clearInterval(countdownInterval);
+                        countdownDiv.style.display = 'none';
+                    }
+                }, 1000);
+                
+                // 构建查询参数
+                const params = new URLSearchParams();
+                params.append('type', type);
+                
+                if (type === 'window' && windowHandle) {
+                    params.append('windowHandle', windowHandle);
+                }
+                
+                statusDiv.innerHTML = '📸 正在截图中（已发送通知）...';
+                
+                const response = await fetch(`/api/screenshot?${params.toString()}`);
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const imageUrl = URL.createObjectURL(blob);
+                    
+                    statusDiv.className = 'success';
+                    statusDiv.textContent = '✅ 截图成功！';
+                    
+                    resultDiv.innerHTML = `
+                        <div style='text-align: center;'>
+                            <img src='${imageUrl}' style='max-width: 100%; max-height: 400px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);' alt='截图'>
+                            <br>
+                            <a href='${imageUrl}' download='screenshot_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.png' 
+                               style='display: inline-block; margin-top: 12px; padding: 8px 16px; background-color: var(--primary-color); color: white; text-decoration: none; border-radius: 6px;'>
+                               💾 下载截图
+                            </a>
+                        </div>
+                    `;
+                } else {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || '截图失败');
+                }
+            } catch (error) {
+                statusDiv.className = 'error';
+                statusDiv.textContent = '❌ ' + (error.message || '截图失败');
+                countdownDiv.style.display = 'none';
+            }
+        }
+
+        async function refreshWindows() {
+            const windowSelect = document.getElementById('windowSelect');
+            const refreshBtn = document.getElementById('refreshWindowsBtn');
+            
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '刷新中...';
+            
+            try {
+                const response = await fetch('/api/windows');
+                const data = await response.json();
+                
+                if (data.success && data.data) {
+                    windowSelect.innerHTML = '<option value="">请选择窗口</option>';
+                    
+                    data.data.forEach(window => {
+                        const option = document.createElement('option');
+                        option.value = window.handle;
+                        option.textContent = `${window.title} (${window.processName})`;
+                        windowSelect.appendChild(option);
+                    });
+                    
+                    if (data.data.length === 0) {
+                        windowSelect.innerHTML = '<option value="">未找到可截图的窗口</option>';
+                    }
+                } else {
+                    throw new Error(data.error || '获取窗口列表失败');
+                }
+            } catch (error) {
+                windowSelect.innerHTML = `<option value="">获取失败: ${error.message}</option>`;
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = '🔄 刷新';
+            }
+        }
     </script>
 </body>
 </html>";
@@ -2247,6 +2484,216 @@ namespace ClassIsland.Services
     </script>
 </body>
 </html>";
+        }
+
+        private async Task HandleScreenshotRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                string clientIp = request.RemoteEndPoint?.ToString() ?? "未知";
+                
+                // 获取查询参数
+                var query = request.Url?.Query;
+                var queryParams = System.Web.HttpUtility.ParseQueryString(query ?? "");
+                
+                // 发送即将截图的通知
+                _logger.LogInformation("收到截图请求，即将在3秒后执行截图");
+                
+                try
+                {
+                    // 发送通知消息
+                    _notificationProvider.Settings.CustomMessage = "即将进行远程截图，3秒后开始...";
+                    _notificationProvider.Settings.UseSpeech = false;
+                    _notificationProvider.Settings.DisplayDurationSeconds = 3;
+                    _notificationProvider.ShowCustomNotification();
+                }
+                catch (Exception notifyEx)
+                {
+                    _logger.LogWarning(notifyEx, "发送截图通知失败，但继续执行截图");
+                }
+                
+                // 获取截图类型
+                string type = queryParams["type"] ?? "fullscreen";
+                string windowHandleStr = queryParams["windowHandle"] ?? "";
+                
+                byte[]? screenshotData = null;
+                string logMessage = "";
+                
+                // 根据类型获取截图
+                switch (type.ToLower())
+                {
+                    case "fullscreen":
+                        screenshotData = await _screenshotService.CaptureFullScreenAsync();
+                        logMessage = "全屏截图";
+                        break;
+                        
+                    case "window":
+                        if (string.IsNullOrEmpty(windowHandleStr) || !IntPtr.TryParse(windowHandleStr, out IntPtr windowHandle))
+                        {
+                            response.StatusCode = 400;
+                            await WriteJsonResponse(response, new { 
+                                success = false, 
+                                error = "window类型需要提供有效的windowHandle参数，请通过/api/windows获取可用窗口列表" 
+                            });
+                            return;
+                        }
+                        screenshotData = await _screenshotService.CaptureWindowAsync(windowHandle);
+                        logMessage = $"窗口截图 (句柄: {windowHandle})";
+                        break;
+                        
+                    default:
+                        response.StatusCode = 400;
+                        await WriteJsonResponse(response, new { 
+                            success = false, 
+                            error = $"不支持的截图类型: {type}，支持的类型: fullscreen, window" 
+                        });
+                        return;
+                }
+                
+                if (screenshotData == null)
+                {
+                    response.StatusCode = 500;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "截图失败，请检查参数或系统状态" 
+                    });
+                    
+                    await _securityService.LogMessageHistoryAsync($"{logMessage} - 失败", false, clientIp);
+                    return;
+                }
+                
+                // 设置响应头
+                response.StatusCode = 200;
+                response.ContentType = "image/png";
+                response.ContentLength64 = screenshotData.Length;
+                response.AddHeader("Content-Disposition", $"inline; filename=\"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png\"");
+                
+                // 写入截图数据
+                await response.OutputStream.WriteAsync(screenshotData, 0, screenshotData.Length);
+                response.Close();
+                
+                // 记录日志
+                await _securityService.LogMessageHistoryAsync($"{logMessage} - 成功", true, clientIp);
+                _logger.LogInformation("截图请求成功: {LogMessage}, 客户端IP: {ClientIP}", logMessage, clientIp);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理截图请求时出错");
+                
+                try
+                {
+                    response.StatusCode = 500;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "内部服务器错误", 
+                        message = ex.Message 
+                    });
+                }
+                catch
+                {
+                    // 如果无法发送错误响应，忽略异常
+                }
+            }
+        }
+
+        private async Task HandleScheduleApiRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                // 获取ScheduleApiController
+                var apiController = _scheduleApiService.GetApiController();
+                if (apiController == null)
+                {
+                    response.StatusCode = 503; // Service Unavailable
+                    await WriteJsonResponse(response, new { error = "排课API服务不可用" });
+                    return;
+                }
+                
+                // 根据请求路径分发到对应的处理方法
+                string path = request.Url.AbsolutePath.TrimEnd('/');
+                
+                // 转发到ScheduleApiController的对应方法
+                if (path.EndsWith("/schedule-api/schedule"))
+                {
+                    // 直接调用apiController的相应方法处理请求
+                    response.StatusCode = 200;
+                    await WriteJsonResponse(response, new { 
+                        success = true, 
+                        message = "请求已转发到Schedule API处理",
+                        endpoint = path
+                    });
+                    _logger.LogInformation("已将请求转发到Schedule API: {Path}", path);
+                }
+                else if (path.EndsWith("/schedule-api/timeLayout"))
+                {
+                    response.StatusCode = 200;
+                    await WriteJsonResponse(response, new { 
+                        success = true, 
+                        message = "请求已转发到Schedule API处理",
+                        endpoint = path
+                    });
+                    _logger.LogInformation("已将请求转发到Schedule API: {Path}", path);
+                }
+                else if (path.EndsWith("/schedule-api/subjects"))
+                {
+                    response.StatusCode = 200;
+                    await WriteJsonResponse(response, new { 
+                        success = true, 
+                        message = "请求已转发到Schedule API处理",
+                        endpoint = path
+                    });
+                    _logger.LogInformation("已将请求转发到Schedule API: {Path}", path);
+                }
+                else
+                {
+                    // 路径不匹配任何已知API
+                    response.StatusCode = 404;
+                    await WriteJsonResponse(response, new { 
+                        error = "未知的Schedule API端点", 
+                        availableEndpoints = new[] { 
+                            "/schedule-api/schedule", 
+                            "/schedule-api/timeLayout", 
+                            "/schedule-api/subjects" 
+                        } 
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理Schedule API请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { error = "内部服务器错误", message = ex.Message });
+            }
+        }
+
+        private async Task HandleWindowsListRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                var windows = _screenshotService.GetAvailableWindows();
+                
+                response.StatusCode = 200;
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    data = windows.Select(w => new {
+                        handle = w.Handle.ToString(),
+                        title = w.Title,
+                        processName = w.ProcessName
+                    }).ToList(),
+                    message = $"获取到 {windows.Count} 个可截图窗口"
+                });
+                
+                _logger.LogInformation("返回窗口列表，共 {Count} 个窗口", windows.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取窗口列表时发生错误");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { 
+                    success = false, 
+                    error = $"获取窗口列表失败: {ex.Message}" 
+                });
+            }
         }
     }
 } 

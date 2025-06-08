@@ -268,5 +268,20 @@ namespace ClassIsland.Services
                 _logger.LogError(ex, "记录消息历史时出错");
             }
         }
+        
+        /// <summary>
+        /// 获取当前配置的访问令牌
+        /// </summary>
+        /// <returns>当前访问令牌，如果未配置则返回null</returns>
+        public string GetCurrentToken()
+        {
+            if (!IsTokenConfigured || string.IsNullOrEmpty(_accessToken))
+            {
+                _logger.LogWarning("尝试获取未配置的访问令牌");
+                return null;
+            }
+            
+            return _accessToken;
+        }
     }
 } 

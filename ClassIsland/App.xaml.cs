@@ -504,6 +504,13 @@ public partial class App : AppBase, IAppHost
                 services.AddSingleton<WebMessageServer>();
                 services.AddSingleton<MessageSecurityService>();
                 
+                // 添加排课系统API服务
+                services.AddSingleton<ScheduleApiService>();
+                services.AddHostedService(provider => provider.GetRequiredService<ScheduleApiService>());
+                
+                // 添加截图服务
+                services.AddSingleton<ScreenshotService>();
+                
                 // 记录管理员权限状态
                 var isAdmin = IsRunAsAdministrator();
                 Logger?.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);
