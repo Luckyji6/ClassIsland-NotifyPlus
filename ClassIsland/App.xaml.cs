@@ -511,6 +511,9 @@ public partial class App : AppBase, IAppHost
                 // 添加截图服务
                 services.AddSingleton<ScreenshotService>();
                 
+                // 添加窗口控制服务
+                services.AddSingleton<WindowControlService>();
+                
                 // 记录管理员权限状态
                 var isAdmin = IsRunAsAdministrator();
                 Logger?.LogInformation("当前应用程序是否以管理员身份运行: {IsAdmin}", isAdmin);

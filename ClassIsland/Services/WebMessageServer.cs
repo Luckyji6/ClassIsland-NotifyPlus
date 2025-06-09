@@ -29,6 +29,7 @@ namespace ClassIsland.Services
         private readonly MessageSecurityService _securityService;
         private readonly ScheduleApiService _scheduleApiService;
         private readonly ScreenshotService _screenshotService;
+        private readonly WindowControlService _windowControlService;
         private HttpListener? _httpListener;
         private CancellationTokenSource? _cts;
         private Task? _serverTask;
@@ -67,6 +68,7 @@ namespace ClassIsland.Services
             MessageSecurityService securityService,
             ScheduleApiService scheduleApiService,
             ScreenshotService screenshotService,
+            WindowControlService windowControlService,
             IHostApplicationLifetime hostApplicationLifetime)
         {
             _logger = logger;
@@ -75,6 +77,7 @@ namespace ClassIsland.Services
             _securityService = securityService;
             _scheduleApiService = scheduleApiService;
             _screenshotService = screenshotService;
+            _windowControlService = windowControlService;
             _hostApplicationLifetime = hostApplicationLifetime;
             
             // 在构造函数中记录初始化信息
@@ -721,10 +724,23 @@ namespace ClassIsland.Services
                                     await HandleWindowsListRequest(response);
                                     continue;
                                 }
+                                else if (request.Url.AbsolutePath == "/api/close-windows")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleCloseableWindowsRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求
-                            if (request.HttpMethod == "POST")
+                                                        if (request.HttpMethod == "POST")
                             {
                                 if (request.Url.AbsolutePath == "/api/login")
                                 {
@@ -734,6 +750,19 @@ namespace ClassIsland.Services
                                 else if (request.Url.AbsolutePath == "/api/setup")
                                 {
                                     await HandleSetupRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/close-window")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleCloseWindowRequest(request, response);
                                     continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/api/message")
@@ -824,6 +853,20 @@ namespace ClassIsland.Services
                                         endpoint = "/api/windows",
                                         method = "GET",
                                         description = "获取可截图的窗口列表"
+                                    },
+                                    new {
+                                        endpoint = "/api/close-windows",
+                                        method = "GET", 
+                                        description = "获取可关闭的窗口列表"
+                                    },
+                                    new {
+                                        endpoint = "/api/close-window",
+                                        method = "POST",
+                                        description = "关闭指定窗口",
+                                        example = new {
+                                            windowHandle = "窗口句柄",
+                                            forceClose = false
+                                        }
                                     },
                                     new {
                                         endpoint = "/schedule-api/schedule",
@@ -1269,6 +1312,38 @@ namespace ClassIsland.Services
         </div>
 
         <div class='card'>
+            <h2>🗙 远程关闭窗口</h2>
+            <div class='form-group'>
+                <label for='closeWindowSelect'>选择要关闭的窗口</label>
+                <div style='display: flex; gap: 10px; align-items: stretch;'>
+                    <select id='closeWindowSelect' style='flex: 1; min-width: 0; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; box-sizing: border-box;'>
+                        <option value=''>请先刷新窗口列表</option>
+                    </select>
+                    <button type='button' id='refreshCloseWindowsBtn' onclick='refreshCloseWindows()' style='background: #2196F3; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 14px; cursor: pointer; white-space: nowrap; flex-shrink: 0; min-width: 100px;'>
+                        🔄 刷新
+                    </button>
+                </div>
+            </div>
+            
+            <div class='form-group'>
+                <label>
+                    <input type='checkbox' id='forceCloseCheckbox' style='margin-right: 8px;'> 
+                    强制关闭（直接终止进程，谨慎使用）
+                </label>
+            </div>
+            
+            <div id='windowCloseWarning' style='display: none; background: #FFF3CD; border: 1px solid #FFEAA7; border-radius: 8px; padding: 12px; margin: 10px 0; color: #856404;'>
+                <strong>⚠️ 警告：</strong>关闭窗口可能导致数据丢失，请确保已保存重要数据。系统关键窗口将被自动过滤。
+            </div>
+            
+            <button type='button' onclick='closeSelectedWindow()' id='closeWindowBtn' disabled style='background: #f44336; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; opacity: 0.5;'>
+                🗙 关闭窗口
+            </button>
+            
+            <div id='windowCloseStatus' style='margin-top: 16px; display: none;'></div>
+        </div>
+
+        <div class='card'>
             <h2>📸 远程截图</h2>
             <div class='form-group'>
                 <label for='screenshotType'>截图类型</label>
@@ -1386,6 +1461,24 @@ namespace ClassIsland.Services
             }
         });
 
+        // 窗口关闭相关事件监听
+        document.getElementById('closeWindowSelect').addEventListener('change', function() {
+            const closeButton = document.getElementById('closeWindowBtn');
+            const warning = document.getElementById('windowCloseWarning');
+            
+            if (this.value) {
+                closeButton.disabled = false;
+                closeButton.style.opacity = '1';
+                closeButton.style.cursor = 'pointer';
+                warning.style.display = 'block';
+            } else {
+                closeButton.disabled = true;
+                closeButton.style.opacity = '0.5';
+                closeButton.style.cursor = 'not-allowed';
+                warning.style.display = 'none';
+            }
+        });
+
         async function takeScreenshot() {
             const statusDiv = document.getElementById('screenshotStatus');
             const resultDiv = document.getElementById('screenshotResult');
@@ -1475,6 +1568,115 @@ namespace ClassIsland.Services
             } finally {
                 refreshBtn.disabled = false;
                 refreshBtn.textContent = '🔄 刷新';
+            }
+        }
+
+        async function refreshCloseWindows() {
+            const closeWindowSelect = document.getElementById('closeWindowSelect');
+            const refreshBtn = document.getElementById('refreshCloseWindowsBtn');
+            
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '刷新中...';
+            
+            try {
+                const response = await fetch('/api/close-windows');
+                const data = await response.json();
+                
+                if (data.success && data.data) {
+                    closeWindowSelect.innerHTML = '<option value="">请选择要关闭的窗口</option>';
+                    
+                    data.data.forEach(window => {
+                        const option = document.createElement('option');
+                        option.value = window.handle;
+                        
+                        let displayText = `${window.title} (${window.processName})`;
+                        if (!window.isCloseable) {
+                            displayText += ' - 系统窗口';
+                            option.disabled = true;
+                            option.style.color = '#999';
+                        }
+                        if (window.isCurrentProcess) {
+                            displayText += ' - 本程序';
+                            option.disabled = true;
+                            option.style.color = '#f44336';
+                        }
+                        
+                        option.textContent = displayText;
+                        closeWindowSelect.appendChild(option);
+                    });
+                    
+                    if (data.data.length === 0) {
+                        closeWindowSelect.innerHTML = '<option value="">未找到可关闭的窗口</option>';
+                    }
+                } else {
+                    throw new Error(data.error || '获取可关闭窗口列表失败');
+                }
+            } catch (error) {
+                closeWindowSelect.innerHTML = `<option value="">获取失败: ${error.message}</option>`;
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = '🔄 刷新';
+            }
+        }
+
+        async function closeSelectedWindow() {
+            const closeWindowSelect = document.getElementById('closeWindowSelect');
+            const forceCloseCheckbox = document.getElementById('forceCloseCheckbox');
+            const statusDiv = document.getElementById('windowCloseStatus');
+            const closeButton = document.getElementById('closeWindowBtn');
+            
+            const windowHandle = closeWindowSelect.value;
+            if (!windowHandle) {
+                alert('请先选择要关闭的窗口');
+                return;
+            }
+            
+            const selectedOption = closeWindowSelect.options[closeWindowSelect.selectedIndex];
+            const windowTitle = selectedOption.textContent;
+            
+            // 显示确认对话框
+            const forceClose = forceCloseCheckbox.checked;
+            const confirmMessage = `确定要${forceClose ? '强制' : ''}关闭窗口吗？\\n\\n${windowTitle}\\n\\n${forceClose ? '强制关闭将直接终止进程，可能导致数据丢失！' : '将发送关闭消息，程序可能会询问是否保存数据。'}`;
+            
+            if (!confirm(confirmMessage)) {
+                return;
+            }
+            
+            statusDiv.innerHTML = '🔄 正在关闭窗口...';
+            statusDiv.className = '';
+            statusDiv.style.display = 'block';
+            closeButton.disabled = true;
+            
+            try {
+                const response = await fetch('/api/close-window', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        windowHandle: windowHandle,
+                        forceClose: forceClose
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    statusDiv.className = 'success';
+                    statusDiv.innerHTML = `✅ 成功关闭窗口：${result.windowTitle || windowTitle}<br>方法：${result.method || (forceClose ? '强制终止进程' : '发送关闭消息')}`;
+                    
+                    // 自动刷新窗口列表
+                    setTimeout(() => {
+                        refreshCloseWindows();
+                    }, 1000);
+                } else {
+                    throw new Error(result.errorMessage || result.error || '关闭窗口失败');
+                }
+            } catch (error) {
+                statusDiv.className = 'error';
+                statusDiv.innerHTML = `❌ 关闭窗口失败：${error.message}`;
+            } finally {
+                closeButton.disabled = false;
             }
         }
     </script>
@@ -2657,6 +2859,167 @@ namespace ClassIsland.Services
                     success = false, 
                     error = $"获取窗口列表失败: {ex.Message}" 
                 });
+            }
+        }
+
+        private async Task HandleCloseableWindowsRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                var windows = _windowControlService.GetCloseableWindows();
+                
+                response.StatusCode = 200;
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    data = windows.Select(w => new {
+                        handle = w.Handle.ToString(),
+                        title = w.Title,
+                        processName = w.ProcessName,
+                        isCloseable = w.IsCloseable,
+                        isCurrentProcess = w.IsCurrentProcess,
+                        closeableReason = w.CloseableReason
+                    }).ToList(),
+                    message = $"获取到 {windows.Count} 个窗口，其中 {windows.Count(w => w.IsCloseable)} 个可关闭"
+                });
+                
+                _logger.LogInformation("返回可关闭窗口列表，共 {Count} 个窗口，其中 {CloseableCount} 个可关闭", 
+                    windows.Count, windows.Count(w => w.IsCloseable));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取可关闭窗口列表时发生错误");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { 
+                    success = false, 
+                    error = $"获取可关闭窗口列表失败: {ex.Message}" 
+                });
+            }
+        }
+
+        private async Task HandleCloseWindowRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                string clientIp = request.RemoteEndPoint?.ToString() ?? "未知";
+                
+                // 读取POST请求体
+                string requestBody;
+                using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                {
+                    requestBody = await reader.ReadToEndAsync();
+                }
+                
+                if (string.IsNullOrEmpty(requestBody))
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "请求体不能为空" 
+                    });
+                    return;
+                }
+                
+                // 解析JSON请求
+                dynamic? requestData;
+                try
+                {
+                    requestData = JsonConvert.DeserializeObject(requestBody);
+                }
+                catch (JsonException ex)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = $"JSON格式错误: {ex.Message}" 
+                    });
+                    return;
+                }
+                
+                if (requestData == null)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "无效的请求数据" 
+                    });
+                    return;
+                }
+                
+                // 获取参数
+                string windowHandleStr = requestData.windowHandle?.ToString() ?? "";
+                bool forceClose = requestData.forceClose ?? false;
+                
+                if (string.IsNullOrEmpty(windowHandleStr) || !IntPtr.TryParse(windowHandleStr, out IntPtr windowHandle))
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "windowHandle参数无效，请提供有效的窗口句柄" 
+                    });
+                    return;
+                }
+                
+                _logger.LogInformation("收到关闭窗口请求: 句柄={Handle}, 强制关闭={ForceClose}, 客户端IP={ClientIP}", 
+                    windowHandle, forceClose, clientIp);
+                
+                // 调用窗口控制服务关闭窗口
+                var result = _windowControlService.CloseWindow(windowHandle, forceClose);
+                
+                if (result.Success)
+                {
+                    response.StatusCode = 200;
+                    await WriteJsonResponse(response, new { 
+                        success = true,
+                        windowTitle = result.WindowTitle,
+                        processName = result.ProcessName,
+                        method = result.Method,
+                        message = $"成功关闭窗口: {result.WindowTitle}"
+                    });
+                    
+                    // 记录操作日志
+                    await _securityService.LogMessageHistoryAsync(
+                        $"关闭窗口: {result.WindowTitle} ({result.ProcessName}) - {result.Method}", 
+                        true, clientIp);
+                    
+                    _logger.LogInformation("关闭窗口成功: {Title} ({ProcessName}), 方法: {Method}, 客户端IP: {ClientIP}", 
+                        result.WindowTitle, result.ProcessName, result.Method, clientIp);
+                }
+                else
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = result.ErrorMessage,
+                        windowTitle = result.WindowTitle,
+                        processName = result.ProcessName
+                    });
+                    
+                    // 记录失败日志
+                    await _securityService.LogMessageHistoryAsync(
+                        $"关闭窗口失败: {result.ErrorMessage}", 
+                        false, clientIp);
+                    
+                    _logger.LogWarning("关闭窗口失败: {ErrorMessage}, 客户端IP: {ClientIP}", 
+                        result.ErrorMessage, clientIp);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理关闭窗口请求时出错");
+                
+                try
+                {
+                    response.StatusCode = 500;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "内部服务器错误", 
+                        message = ex.Message 
+                    });
+                }
+                catch
+                {
+                    // 如果无法发送错误响应，忽略异常
+                }
             }
         }
     }
