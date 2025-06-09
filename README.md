@@ -87,7 +87,7 @@
      - 窗口截图: `http://[IP地址]:8088/api/screenshot?type=window&windowHandle=123456`
    - **响应**: 返回PNG格式的图片文件
    - **特性**:
-     - 截图前3秒延迟，给用户准备时间
+     - 立即执行截图，无延迟
      - 自动添加ClassIsland时间水印
      - 支持下载和预览
 

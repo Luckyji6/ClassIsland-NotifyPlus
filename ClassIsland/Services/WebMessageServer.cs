@@ -814,7 +814,7 @@ namespace ClassIsland.Services
                                     new {
                                         endpoint = "/api/screenshot",
                                         method = "GET",
-                                        description = "获取屏幕截图（延迟3秒执行）",
+                                        description = "获取屏幕截图",
                                         parameters = new {
                                             type = "截图类型：fullscreen(全屏)、window(指定窗口)",
                                             windowHandle = "窗口句柄（可选，仅用于window类型，通过/api/windows获取）"
@@ -1290,11 +1290,9 @@ namespace ClassIsland.Services
                 </div>
             </div>
             
-            <div id='countdownDisplay' style='display: none; text-align: center; font-size: 18px; font-weight: bold; color: #FF6B6B; margin: 15px 0;'>
-                即将截图: <span id='countdownTimer'>3</span> 秒
-            </div>
+
             
-            <button type='button' onclick='takeScreenshot()'>📸 截图（延迟3秒）</button>
+            <button type='button' onclick='takeScreenshot()'>📸 立即截图</button>
             
             <div id='screenshotStatus' style='margin-top: 16px; display: none;'></div>
             <div id='screenshotResult' style='margin-top: 16px;'></div>
@@ -1391,10 +1389,8 @@ namespace ClassIsland.Services
         async function takeScreenshot() {
             const statusDiv = document.getElementById('screenshotStatus');
             const resultDiv = document.getElementById('screenshotResult');
-            const countdownDiv = document.getElementById('countdownDisplay');
-            const countdownTimer = document.getElementById('countdownTimer');
             
-            statusDiv.innerHTML = '📸 准备截图...';
+            statusDiv.innerHTML = '📸 正在截图...';
             statusDiv.className = '';
             statusDiv.style.display = 'block';
             resultDiv.innerHTML = '';
@@ -1410,21 +1406,6 @@ namespace ClassIsland.Services
                     }
                 }
                 
-                // 显示倒计时
-                countdownDiv.style.display = 'block';
-                let count = 3;
-                countdownTimer.textContent = count;
-                
-                const countdownInterval = setInterval(() => {
-                    count--;
-                    if (count > 0) {
-                        countdownTimer.textContent = count;
-                    } else {
-                        clearInterval(countdownInterval);
-                        countdownDiv.style.display = 'none';
-                    }
-                }, 1000);
-                
                 // 构建查询参数
                 const params = new URLSearchParams();
                 params.append('type', type);
@@ -1432,8 +1413,6 @@ namespace ClassIsland.Services
                 if (type === 'window' && windowHandle) {
                     params.append('windowHandle', windowHandle);
                 }
-                
-                statusDiv.innerHTML = '📸 正在截图中（已发送通知）...';
                 
                 const response = await fetch(`/api/screenshot?${params.toString()}`);
                 
@@ -1461,7 +1440,6 @@ namespace ClassIsland.Services
             } catch (error) {
                 statusDiv.className = 'error';
                 statusDiv.textContent = '❌ ' + (error.message || '截图失败');
-                countdownDiv.style.display = 'none';
             }
         }
 
@@ -2496,21 +2474,7 @@ namespace ClassIsland.Services
                 var query = request.Url?.Query;
                 var queryParams = System.Web.HttpUtility.ParseQueryString(query ?? "");
                 
-                // 发送即将截图的通知
-                _logger.LogInformation("收到截图请求，即将在3秒后执行截图");
-                
-                try
-                {
-                    // 发送通知消息
-                    _notificationProvider.Settings.CustomMessage = "即将进行远程截图，3秒后开始...";
-                    _notificationProvider.Settings.UseSpeech = false;
-                    _notificationProvider.Settings.DisplayDurationSeconds = 3;
-                    _notificationProvider.ShowCustomNotification();
-                }
-                catch (Exception notifyEx)
-                {
-                    _logger.LogWarning(notifyEx, "发送截图通知失败，但继续执行截图");
-                }
+                _logger.LogInformation("收到截图请求，开始执行截图");
                 
                 // 获取截图类型
                 string type = queryParams["type"] ?? "fullscreen";

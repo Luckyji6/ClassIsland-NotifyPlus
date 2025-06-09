@@ -28,17 +28,14 @@ namespace ClassIsland.Services
         }
 
         /// <summary>
-        /// 获取全屏截图（延迟3秒）
+        /// 获取全屏截图
         /// </summary>
         /// <returns>截图的字节数组</returns>
         public async Task<byte[]?> CaptureFullScreenAsync()
         {
             try
             {
-                _logger.LogInformation("即将进行全屏截图，3秒后开始...");
-                
-                // 延迟3秒
-                await Task.Delay(3000);
+                _logger.LogInformation("开始进行全屏截图...");
                 
                 var screen = Screen.PrimaryScreen;
                 if (screen == null)
@@ -72,7 +69,7 @@ namespace ClassIsland.Services
         }
 
         /// <summary>
-        /// 获取指定窗口的截图（延迟3秒）
+        /// 获取指定窗口的截图
         /// </summary>
         /// <param name="windowHandle">窗口句柄</param>
         /// <returns>截图的字节数组</returns>
@@ -80,10 +77,7 @@ namespace ClassIsland.Services
         {
             try
             {
-                _logger.LogInformation("即将进行窗口截图，3秒后开始...");
-                
-                // 延迟3秒
-                await Task.Delay(3000);
+                _logger.LogInformation("开始进行窗口截图...");
                 
                 if (windowHandle == IntPtr.Zero)
                 {
