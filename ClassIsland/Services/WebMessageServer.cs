@@ -48,6 +48,17 @@ namespace ClassIsland.Services
         private DateTime _exitTokenSetTime = DateTime.MinValue;
         private const int EXIT_TOKEN_LENGTH = 8; // 令牌长度
         
+        // 自动关闭窗口相关字段
+        private string? _autoCloseKeyword = null;
+        private bool _autoCloseForceClose = false;
+        private bool _autoCloseRunning = false;
+        private Timer? _autoCloseTimer = null;
+        private int _autoCloseCount = 0;
+        private DateTime _autoCloseStartTime = DateTime.MinValue;
+        private readonly List<string> _autoCloseLog = new();
+        private const int AUTO_CLOSE_INTERVAL_MS = 30000; // 30秒间隔
+        private const int MAX_LOG_ENTRIES = 100; // 最大日志条数
+        
         /// <summary>
         /// 验证退出令牌
         /// </summary>
@@ -559,6 +570,9 @@ namespace ClassIsland.Services
             _logger.LogInformation("正在停止Web消息服务器...");
             try
             {
+                // 停止自动关闭定时器
+                StopAutoClose();
+                
                 // 首先取消所有任务
                 if (_cts != null && !_cts.IsCancellationRequested)
                 {
@@ -810,6 +824,32 @@ namespace ClassIsland.Services
                                     await HandleExitTokenStatusRequest(response);
                                     continue;
                                 }
+                                else if (request.Url.AbsolutePath == "/api/auto-close/status")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleAutoCloseStatusRequest(response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/auto-close/logs")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleAutoCloseLogsRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求
@@ -862,6 +902,32 @@ namespace ClassIsland.Services
                                     }
                                     
                                     await HandleClearExitTokenRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/auto-close/start")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleStartAutoCloseRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/auto-close/stop")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleStopAutoCloseRequest(request, response);
                                     continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/api/message")
@@ -1504,6 +1570,57 @@ namespace ClassIsland.Services
             
             <div id='tokenOperationStatus' style='margin-top: 16px; display: none;'></div>
         </div>
+
+        <div class='card'>
+            <h2>🤖 自动关闭窗口</h2>
+            <p>后台自动监控并关闭包含指定关键词的窗口，每30秒自动检查一次，无需保持网页打开</p>
+            
+            <div class='form-group'>
+                <label for='autoCloseKeyword'>关键词</label>
+                <input type='text' id='autoCloseKeyword' placeholder='输入要监控的关键词（如：游戏、视频等）' style='width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; box-sizing: border-box;'>
+            </div>
+            
+            <div class='form-group'>
+                <label>
+                    <input type='checkbox' id='autoCloseForceClose' style='margin-right: 8px;'> 
+                    强制关闭（直接终止进程，谨慎使用）
+                </label>
+            </div>
+            
+            <div style='display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;'>
+                <button type='button' onclick='startAutoClose()' id='startAutoCloseBtn' style='background: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer;'>
+                    ▶️ 开始监控
+                </button>
+                <button type='button' onclick='stopAutoClose()' id='stopAutoCloseBtn' disabled style='background: #f44336; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; opacity: 0.5;'>
+                    ⏹️ 停止监控
+                </button>
+                <button type='button' onclick='testAutoClose()' id='testAutoCloseBtn' style='background: #FF9800; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer;'>
+                    🔍 测试一次
+                </button>
+            </div>
+            
+            <div id='autoCloseStatus' style='margin-bottom: 15px; padding: 10px; border-radius: 8px; background: #f8f9fa; color: #6c757d;'>
+                ⚪ 监控未启动
+            </div>
+            
+            <div style='background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 15px; font-size: 14px; color: #856404; margin-bottom: 15px;'>
+                <strong>⚠️ 使用提醒：</strong>
+                <ul style='margin: 5px 0 0 20px; padding-left: 0;'>
+                    <li><strong>监控在后台运行，无需保持网页打开</strong></li>
+                    <li>系统会每30秒自动检查一次窗口列表</li>
+                    <li>包含关键词的窗口标题将被自动关闭</li>
+                    <li>关键词匹配不区分大小写</li>
+                    <li>系统关键窗口和本程序窗口会被自动跳过</li>
+                    <li>请谨慎设置关键词，避免误关闭重要窗口</li>
+                    <li>强制关闭可能导致数据丢失，请谨慎使用</li>
+                    <li>应用重启后监控会停止，需要重新启动</li>
+                </ul>
+            </div>
+            
+            <div id='autoCloseLog' style='background: #f8f9fa; border-radius: 8px; padding: 15px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap;'>
+                正在加载日志...
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1936,10 +2053,228 @@ namespace ClassIsland.Services
             }
         }
 
-        // 页面加载时自动刷新令牌状态
+        // 自动关闭窗口相关变量
+        let autoCloseRunning = false;
+        let autoCloseRefreshInterval = null;
+        
+        // 页面加载时自动刷新令牌状态和自动关闭状态
         document.addEventListener('DOMContentLoaded', function() {
             refreshTokenStatus();
+            refreshAutoCloseStatus();
+            refreshAutoCloseLogs();
+            
+            // 如果自动关闭正在运行，开始自动刷新
+            setTimeout(() => {
+                if (autoCloseRunning) {
+                    startAutoRefresh();
+                }
+            }, 1000);
         });
+        
+        // 自动关闭窗口相关函数
+        async function startAutoClose() {
+            const keyword = document.getElementById('autoCloseKeyword').value.trim();
+            const forceClose = document.getElementById('autoCloseForceClose').checked;
+            
+            if (!keyword) {
+                alert('请输入要监控的关键词！');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/auto-close/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        keyword: keyword,
+                        forceClose: forceClose
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`✅ ${data.message}\n关键词：${data.keyword}\n检查间隔：${data.interval}秒`);
+                    refreshAutoCloseStatus();
+                    // 启动后开始定期刷新状态和日志
+                    startAutoRefresh();
+                } else {
+                    alert(`❌ ${data.error}`);
+                }
+            } catch (error) {
+                alert(`❌ 启动失败：${error.message}`);
+            }
+        }
+        
+        async function stopAutoClose() {
+            try {
+                const response = await fetch('/api/auto-close/stop', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`✅ ${data.message}`);
+                    refreshAutoCloseStatus();
+                    // 停止后停止定期刷新
+                    stopAutoRefresh();
+                } else {
+                    alert(`❌ ${data.error || '停止失败'}`);
+                }
+            } catch (error) {
+                alert(`❌ 停止失败：${error.message}`);
+            }
+        }
+        
+        async function testAutoClose() {
+            const keyword = document.getElementById('autoCloseKeyword').value.trim();
+            const forceClose = document.getElementById('autoCloseForceClose').checked;
+            
+            if (!keyword) {
+                alert('请输入要监控的关键词！');
+                return;
+            }
+            
+            if (!confirm(`确定要执行一次测试检查吗？\n\n关键词：${keyword}\n强制关闭：${forceClose ? '是' : '否'}\n\n测试会立即关闭符合条件的窗口！`)) {
+                return;
+            }
+            
+            try {
+                // 先启动监控（会立即执行一次检查）
+                const startResponse = await fetch('/api/auto-close/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        keyword: keyword,
+                        forceClose: forceClose
+                    })
+                });
+                
+                const startData = await startResponse.json();
+                
+                if (startData.success) {
+                    alert('🔍 测试检查已执行，请查看日志了解结果');
+                    refreshAutoCloseStatus();
+                    refreshAutoCloseLogs();
+                    
+                    // 等待3秒然后停止监控
+                    setTimeout(async () => {
+                        try {
+                            await fetch('/api/auto-close/stop', { method: 'POST' });
+                            refreshAutoCloseStatus();
+                        } catch (e) {
+                            console.error('停止监控失败:', e);
+                        }
+                    }, 3000);
+                } else {
+                    alert(`❌ 测试失败：${startData.error}`);
+                }
+            } catch (error) {
+                alert(`❌ 测试失败：${error.message}`);
+            }
+        }
+        
+        async function refreshAutoCloseStatus() {
+            try {
+                const response = await fetch('/api/auto-close/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    autoCloseRunning = data.isRunning;
+                    updateAutoCloseUI(data);
+                }
+            } catch (error) {
+                console.error('获取自动关闭状态失败:', error);
+            }
+        }
+        
+        async function refreshAutoCloseLogs() {
+            try {
+                const response = await fetch('/api/auto-close/logs');
+                const data = await response.json();
+                
+                if (data.success) {
+                    const logDiv = document.getElementById('autoCloseLog');
+                    if (data.logs && data.logs.length > 0) {
+                        logDiv.textContent = data.logs.join('\n');
+                        logDiv.scrollTop = logDiv.scrollHeight;
+                    } else {
+                        logDiv.textContent = '暂无日志记录...';
+                    }
+                }
+            } catch (error) {
+                console.error('获取自动关闭日志失败:', error);
+            }
+        }
+        
+        function updateAutoCloseUI(statusData) {
+            const startBtn = document.getElementById('startAutoCloseBtn');
+            const stopBtn = document.getElementById('stopAutoCloseBtn');
+            const testBtn = document.getElementById('testAutoCloseBtn');
+            const statusDiv = document.getElementById('autoCloseStatus');
+            
+            if (statusData && statusData.isRunning) {
+                startBtn.disabled = true;
+                startBtn.style.opacity = '0.5';
+                startBtn.style.cursor = 'not-allowed';
+                
+                stopBtn.disabled = false;
+                stopBtn.style.opacity = '1';
+                stopBtn.style.cursor = 'pointer';
+                
+                testBtn.disabled = true;
+                testBtn.style.opacity = '0.5';
+                testBtn.style.cursor = 'not-allowed';
+                
+                statusDiv.style.background = '#d4edda';
+                statusDiv.style.color = '#155724';
+                statusDiv.innerHTML = `🟢 后台监控运行中<br/>关键词：「${statusData.keyword}」<br/>已检查：${statusData.count} 次<br/>开始时间：${statusData.startTime}<br/>检查间隔：${statusData.interval} 秒`;
+            } else {
+                startBtn.disabled = false;
+                startBtn.style.opacity = '1';
+                startBtn.style.cursor = 'pointer';
+                
+                stopBtn.disabled = true;
+                stopBtn.style.opacity = '0.5';
+                stopBtn.style.cursor = 'not-allowed';
+                
+                testBtn.disabled = false;
+                testBtn.style.opacity = '1';
+                testBtn.style.cursor = 'pointer';
+                
+                statusDiv.style.background = '#f8f9fa';
+                statusDiv.style.color = '#6c757d';
+                statusDiv.innerHTML = '⚪ 后台监控未启动';
+            }
+        }
+        
+        function startAutoRefresh() {
+            // 如果已经在刷新，先停止
+            if (autoCloseRefreshInterval) {
+                clearInterval(autoCloseRefreshInterval);
+            }
+            
+            // 每3秒刷新一次状态和日志
+            autoCloseRefreshInterval = setInterval(() => {
+                refreshAutoCloseStatus();
+                refreshAutoCloseLogs();
+            }, 3000);
+        }
+        
+        function stopAutoRefresh() {
+            if (autoCloseRefreshInterval) {
+                clearInterval(autoCloseRefreshInterval);
+                autoCloseRefreshInterval = null;
+            }
+        }
     </script>
 </body>
 </html>";
@@ -3360,5 +3695,387 @@ namespace ClassIsland.Services
                 await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
             }
         }
+
+        #region 自动关闭窗口相关方法
+
+        /// <summary>
+        /// 处理启动自动关闭的请求
+        /// </summary>
+        private async Task HandleStartAutoCloseRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                // 读取POST请求体
+                string requestBody;
+                using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                {
+                    requestBody = await reader.ReadToEndAsync();
+                }
+                
+                if (string.IsNullOrEmpty(requestBody))
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "请求体不能为空" 
+                    });
+                    return;
+                }
+                
+                // 解析JSON请求
+                dynamic? requestData;
+                try
+                {
+                    requestData = JsonConvert.DeserializeObject(requestBody);
+                }
+                catch (JsonException ex)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = $"JSON格式错误: {ex.Message}" 
+                    });
+                    return;
+                }
+                
+                if (requestData == null)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "无效的请求数据" 
+                    });
+                    return;
+                }
+                
+                // 获取参数
+                string keyword = requestData.keyword?.ToString()?.Trim() ?? "";
+                bool forceClose = requestData.forceClose ?? false;
+                
+                if (string.IsNullOrEmpty(keyword))
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "关键词不能为空" 
+                    });
+                    return;
+                }
+                
+                // 启动自动关闭
+                bool started = StartAutoClose(keyword, forceClose);
+                
+                if (started)
+                {
+                    await WriteJsonResponse(response, new { 
+                        success = true, 
+                        message = "自动关闭监控已启动",
+                        keyword = keyword,
+                        forceClose = forceClose,
+                        interval = AUTO_CLOSE_INTERVAL_MS / 1000
+                    });
+                    
+                    _logger.LogInformation("通过Web API启动了自动关闭监控: 关键词={Keyword}, 强制关闭={ForceClose}", 
+                        keyword, forceClose);
+                }
+                else
+                {
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = "监控已在运行中或启动失败" 
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理启动自动关闭请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理停止自动关闭的请求
+        /// </summary>
+        private async Task HandleStopAutoCloseRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                bool stopped = StopAutoClose();
+                
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    message = stopped ? "自动关闭监控已停止" : "监控未在运行" 
+                });
+                
+                _logger.LogInformation("通过Web API停止了自动关闭监控");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理停止自动关闭请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理获取自动关闭状态的请求
+        /// </summary>
+        private async Task HandleAutoCloseStatusRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                var status = new
+                {
+                    success = true,
+                    isRunning = _autoCloseRunning,
+                    keyword = _autoCloseKeyword,
+                    forceClose = _autoCloseForceClose,
+                    count = _autoCloseCount,
+                    startTime = _autoCloseStartTime != DateTime.MinValue ? _autoCloseStartTime.ToString("yyyy-MM-dd HH:mm:ss") : null,
+                    interval = AUTO_CLOSE_INTERVAL_MS / 1000,
+                    nextCheck = _autoCloseRunning && _autoCloseTimer != null ? 
+                        _autoCloseStartTime.AddMilliseconds(AUTO_CLOSE_INTERVAL_MS * (_autoCloseCount + 1)).ToString("yyyy-MM-dd HH:mm:ss") : null
+                };
+                
+                await WriteJsonResponse(response, status);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理自动关闭状态请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理获取自动关闭日志的请求
+        /// </summary>
+        private async Task HandleAutoCloseLogsRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                lock (_autoCloseLog)
+                {
+                    var logs = new
+                    {
+                        success = true,
+                        logs = _autoCloseLog.ToArray(),
+                        count = _autoCloseLog.Count
+                    };
+                    
+                    WriteJsonResponse(response, logs).Wait();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理自动关闭日志请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 启动自动关闭监控
+        /// </summary>
+        public bool StartAutoClose(string keyword, bool forceClose)
+        {
+            if (_autoCloseRunning || string.IsNullOrEmpty(keyword))
+            {
+                return false;
+            }
+            
+            _autoCloseKeyword = keyword;
+            _autoCloseForceClose = forceClose;
+            _autoCloseRunning = true;
+            _autoCloseCount = 0;
+            _autoCloseStartTime = DateTime.Now;
+            
+            lock (_autoCloseLog)
+            {
+                _autoCloseLog.Clear();
+                AddAutoCloseLog($"🟢 自动关闭监控已启动，关键词：「{keyword}」");
+                AddAutoCloseLog($"📝 监控间隔：每{AUTO_CLOSE_INTERVAL_MS / 1000}秒检查一次");
+                AddAutoCloseLog($"⚡ 强制关闭模式：{(forceClose ? "启用" : "禁用")}");
+            }
+            
+            // 创建定时器，30秒后第一次执行，然后每30秒执行一次
+            _autoCloseTimer = new Timer(AutoCloseTimerCallback, null, AUTO_CLOSE_INTERVAL_MS, AUTO_CLOSE_INTERVAL_MS);
+            
+            _logger.LogInformation("自动关闭监控已启动: 关键词={Keyword}, 强制关闭={ForceClose}, 间隔={Interval}ms", 
+                keyword, forceClose, AUTO_CLOSE_INTERVAL_MS);
+            
+            return true;
+        }
+
+        /// <summary>
+        /// 停止自动关闭监控
+        /// </summary>
+        public bool StopAutoClose()
+        {
+            if (!_autoCloseRunning)
+            {
+                return false;
+            }
+            
+            _autoCloseRunning = false;
+            
+            if (_autoCloseTimer != null)
+            {
+                _autoCloseTimer.Dispose();
+                _autoCloseTimer = null;
+            }
+            
+            lock (_autoCloseLog)
+            {
+                AddAutoCloseLog($"🔴 监控已停止，总计进行了 {_autoCloseCount} 次检查");
+            }
+            
+            _logger.LogInformation("自动关闭监控已停止，总计检查次数: {Count}", _autoCloseCount);
+            
+            return true;
+        }
+
+        /// <summary>
+        /// 定时器回调方法
+        /// </summary>
+        private async void AutoCloseTimerCallback(object? state)
+        {
+            if (!_autoCloseRunning || string.IsNullOrEmpty(_autoCloseKeyword))
+            {
+                return;
+            }
+            
+            try
+            {
+                await PerformAutoCloseCheck();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "自动关闭检查过程中出错");
+                lock (_autoCloseLog)
+                {
+                    AddAutoCloseLog($"❌ 检查过程中出错: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// 执行自动关闭检查
+        /// </summary>
+        private async Task PerformAutoCloseCheck()
+        {
+            if (!_autoCloseRunning || string.IsNullOrEmpty(_autoCloseKeyword))
+            {
+                return;
+            }
+            
+            _autoCloseCount++;
+            var timestamp = DateTime.Now.ToString("HH:mm:ss");
+            
+            lock (_autoCloseLog)
+            {
+                AddAutoCloseLog($"[{timestamp}] 🔍 检查窗口列表... (第{_autoCloseCount}次)");
+            }
+            
+            try
+            {
+                // 获取可关闭的窗口列表
+                var windows = _windowControlService.GetCloseableWindows();
+                var matchedWindows = new List<CloseableWindowInfo>();
+                
+                // 查找包含关键词的窗口
+                foreach (var window in windows)
+                {
+                    if (window.IsCloseable && !window.IsCurrentProcess && 
+                        window.Title.Contains(_autoCloseKeyword, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matchedWindows.Add(window);
+                    }
+                }
+                
+                if (matchedWindows.Count == 0)
+                {
+                    lock (_autoCloseLog)
+                    {
+                        AddAutoCloseLog($"[{timestamp}] ✅ 未发现包含关键词的窗口");
+                    }
+                    return;
+                }
+                
+                lock (_autoCloseLog)
+                {
+                    AddAutoCloseLog($"[{timestamp}] 🎯 发现 {matchedWindows.Count} 个匹配窗口：");
+                }
+                
+                // 关闭匹配的窗口
+                foreach (var window in matchedWindows)
+                {
+                    try
+                    {
+                        lock (_autoCloseLog)
+                        {
+                            AddAutoCloseLog($"  🗙 正在关闭：{window.Title} ({window.ProcessName})");
+                        }
+                        
+                        var result = _windowControlService.CloseWindow(window.Handle, _autoCloseForceClose);
+                        
+                        lock (_autoCloseLog)
+                        {
+                            if (result.Success)
+                            {
+                                AddAutoCloseLog($"  ✅ 成功关闭：{window.Title}");
+                            }
+                            else
+                            {
+                                AddAutoCloseLog($"  ❌ 关闭失败：{window.Title} - {result.ErrorMessage}");
+                            }
+                        }
+                        
+                        // 等待100ms避免操作过快
+                        await Task.Delay(100);
+                        
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (_autoCloseLog)
+                        {
+                            AddAutoCloseLog($"  ❌ 关闭异常：{window.Title} - {ex.Message}");
+                        }
+                        _logger.LogError(ex, "关闭窗口时出错: {Title}", window.Title);
+                    }
+                }
+                
+            }
+            catch (Exception ex)
+            {
+                lock (_autoCloseLog)
+                {
+                    AddAutoCloseLog($"[{timestamp}] ❌ 检查失败：{ex.Message}");
+                }
+                _logger.LogError(ex, "执行自动关闭检查时出错");
+            }
+        }
+
+        /// <summary>
+        /// 添加自动关闭日志
+        /// </summary>
+        private void AddAutoCloseLog(string message)
+        {
+            var logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}";
+            
+            lock (_autoCloseLog)
+            {
+                _autoCloseLog.Add(logEntry);
+                
+                // 限制日志条数
+                while (_autoCloseLog.Count > MAX_LOG_ENTRIES)
+                {
+                    _autoCloseLog.RemoveAt(0);
+                }
+            }
+        }
+
+        #endregion
     }
 } 
