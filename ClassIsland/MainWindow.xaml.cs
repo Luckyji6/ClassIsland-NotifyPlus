@@ -910,8 +910,93 @@ public partial class MainWindow : Window
         {
             return;
         }
+        
+        // 检查退出令牌验证
+        if (!await ValidateExitToken())
+        {
+            return;
+        }
+        
         ViewModel.IsClosing = true;
         Close();
+    }
+    
+    /// <summary>
+    /// 验证退出令牌
+    /// </summary>
+    private async Task<bool> ValidateExitToken()
+    {
+        try
+        {
+            // 获取WebMessage服务实例
+            var webMessageServer = App.GetService<WebMessageServer>();
+            if (webMessageServer == null)
+            {
+                // 如果Web服务不可用，显示错误并拒绝退出
+                Core.Controls.CommonDialog.CommonDialog.ShowError("无法验证退出权限：Web服务不可用。\n请确保Web服务正常运行后再试。");
+                return false;
+            }
+            
+            var currentToken = webMessageServer.GetCurrentExitToken();
+            if (string.IsNullOrEmpty(currentToken))
+            {
+                                 // 没有设置令牌，显示提示信息
+                 var result = new Core.Controls.CommonDialogBuilder()
+                     .SetCaption("需要设置退出令牌")
+                     .SetContent("未设置退出令牌\n\n" +
+                         "为了安全起见，必须先通过网页设置退出令牌才能退出应用。\n\n" +
+                         $"请访问 http://localhost:8088/ 设置退出令牌。\n\n" +
+                         "是否要打开网页设置页面？")
+                     .SetIconKind(Core.Enums.CommonDialogIconKind.Hint)
+                     .AddYesAction()
+                     .AddNoAction()
+                     .ShowDialog(this);
+                    
+                if (result == 0) // 第一个按钮是"是"
+                {
+                    try
+                    {
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = "http://localhost:8088/",
+                            UseShellExecute = true
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                                                 Core.Controls.CommonDialog.CommonDialog.ShowError($"无法打开网页：{ex.Message}");
+                    }
+                }
+                return false;
+            }
+            
+            // 已设置令牌，显示输入对话框
+            var tokenDialog = new TokenInputDialog();
+            tokenDialog.Owner = this;
+            
+            if (tokenDialog.ShowDialog() == true)
+            {
+                var inputToken = tokenDialog.Token;
+                if (webMessageServer.ValidateExitToken(inputToken))
+                {
+                    // 验证成功，清除令牌
+                    webMessageServer.ClearExitToken();
+                    return true;
+                }
+                else
+                {
+                    Core.Controls.CommonDialog.CommonDialog.ShowError("退出令牌验证失败！\n请输入正确的令牌。");
+                    return false;
+                }
+            }
+            
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Core.Controls.CommonDialog.CommonDialog.ShowError($"验证退出令牌时发生错误：{ex.Message}");
+            return false;
+        }
     }
 
     private void MainWindow_OnClosing(object? sender, CancelEventArgs e)

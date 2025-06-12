@@ -43,6 +43,66 @@ namespace ClassIsland.Services
 
         public bool IsRunning { get; private set; }
         
+        // 添加退出令牌相关属性
+        private string? _exitToken = null;
+        private DateTime _exitTokenSetTime = DateTime.MinValue;
+        private const int EXIT_TOKEN_LENGTH = 8; // 令牌长度
+        
+        /// <summary>
+        /// 验证退出令牌
+        /// </summary>
+        public bool ValidateExitToken(string token)
+        {
+            if (string.IsNullOrEmpty(_exitToken) || string.IsNullOrEmpty(token))
+            {
+                return false;
+            }
+            
+            var isValid = string.Equals(_exitToken, token, StringComparison.Ordinal);
+            _logger.LogInformation("退出令牌验证: {Result}", isValid ? "通过" : "失败");
+            return isValid;
+        }
+        
+        /// <summary>
+        /// 设置退出令牌
+        /// </summary>
+        public string SetExitToken()
+        {
+            _exitToken = GenerateRandomToken();
+            _exitTokenSetTime = DateTime.Now;
+            _logger.LogInformation("退出令牌已设置: {Token}", _exitToken);
+            return _exitToken;
+        }
+        
+        /// <summary>
+        /// 获取当前退出令牌（如果存在）
+        /// </summary>
+        public string? GetCurrentExitToken()
+        {
+            return _exitToken;
+        }
+        
+        /// <summary>
+        /// 清除退出令牌
+        /// </summary>
+        public void ClearExitToken()
+        {
+            _exitToken = null;
+            _exitTokenSetTime = DateTime.MinValue;
+            _logger.LogInformation("退出令牌已清除");
+        }
+        
+        /// <summary>
+        /// 生成随机令牌
+        /// </summary>
+        private string GenerateRandomToken()
+        {
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            var random = new Random();
+            return new string(Enumerable.Repeat(chars, EXIT_TOKEN_LENGTH)
+                .Select(s => s[random.Next(s.Length)]).ToArray());
+        }
+        
         /// <summary>
         /// 服务器端口，固定为8088
         /// </summary>
@@ -737,6 +797,19 @@ namespace ClassIsland.Services
                                     await HandleCloseableWindowsRequest(response);
                                     continue;
                                 }
+                                else if (request.Url.AbsolutePath == "/api/exit-token/status")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleExitTokenStatusRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求
@@ -763,6 +836,32 @@ namespace ClassIsland.Services
                                     }
                                     
                                     await HandleCloseWindowRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/exit-token/set")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleSetExitTokenRequest(request, response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/exit-token/clear")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleClearExitTokenRequest(request, response);
                                     continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/api/message")
@@ -1372,6 +1471,39 @@ namespace ClassIsland.Services
             <div id='screenshotStatus' style='margin-top: 16px; display: none;'></div>
             <div id='screenshotResult' style='margin-top: 16px;'></div>
         </div>
+
+        <div class='card'>
+            <h2>🔐 退出令牌管理</h2>
+            <p>设置退出令牌后，用户将<strong>无法通过正常渠道退出应用</strong>，必须输入正确的令牌才能退出</p>
+            
+            <div id='tokenStatus' style='margin-bottom: 15px; padding: 10px; border-radius: 8px;'></div>
+            
+            <div style='display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;'>
+                <button type='button' onclick='setExitToken()' style='background: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer;'>
+                    🔑 设置新令牌
+                </button>
+                <button type='button' onclick='clearExitToken()' style='background: #f44336; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer;'>
+                    🗑️ 清除令牌
+                </button>
+                <button type='button' onclick='refreshTokenStatus()' style='background: #2196F3; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer;'>
+                    🔄 刷新状态
+                </button>
+            </div>
+            
+            <div style='background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 15px; font-size: 14px; color: #856404;'>
+                <strong>⚠️ 重要提醒：</strong>
+                <ul style='margin: 5px 0 0 20px; padding-left: 0;'>
+                    <li><strong>设置令牌后，用户将无法通过系统托盘等正常方式退出应用</strong></li>
+                    <li>必须输入正确的8位令牌才能退出应用</li>
+                    <li>令牌为8位大写字母和数字组合，系统自动生成</li>
+                    <li>退出验证成功后，令牌会自动清除</li>
+                    <li>如果忘记令牌，只能通过此网页重新设置或清除</li>
+                    <li>请谨慎设置，确保不会影响正常使用</li>
+                </ul>
+            </div>
+            
+            <div id='tokenOperationStatus' style='margin-top: 16px; display: none;'></div>
+        </div>
     </div>
 
     <script>
@@ -1679,6 +1811,126 @@ namespace ClassIsland.Services
                 closeButton.disabled = false;
             }
         }
+
+        // 退出令牌管理相关函数
+        async function refreshTokenStatus() {
+            const statusDiv = document.getElementById('tokenStatus');
+            const operationStatusDiv = document.getElementById('tokenOperationStatus');
+            
+            try {
+                operationStatusDiv.style.display = 'none';
+                statusDiv.innerHTML = '🔄 正在获取令牌状态...';
+                statusDiv.style.background = '#e3f2fd';
+                statusDiv.style.color = '#1976d2';
+                
+                const response = await fetch('/api/exit-token/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    if (data.hasToken) {
+                        statusDiv.innerHTML = `
+                            ✅ <strong>已设置退出令牌</strong><br>
+                            令牌：<code style='background: #f5f5f5; padding: 2px 6px; border-radius: 4px; font-family: monospace;'>${data.token}</code><br>
+                            设置时间：${data.setTime}
+                        `;
+                        statusDiv.style.background = '#d4edda';
+                        statusDiv.style.color = '#155724';
+                    } else {
+                        statusDiv.innerHTML = '⚠️ <strong>未设置退出令牌</strong><br>应用可以直接退出，建议设置令牌增强安全性';
+                        statusDiv.style.background = '#fff3cd';
+                        statusDiv.style.color = '#856404';
+                    }
+                } else {
+                    throw new Error(data.error || '获取令牌状态失败');
+                }
+            } catch (error) {
+                statusDiv.innerHTML = `❌ 获取令牌状态失败：${error.message}`;
+                statusDiv.style.background = '#f8d7da';
+                statusDiv.style.color = '#721c24';
+            }
+        }
+        
+        async function setExitToken() {
+            const operationStatusDiv = document.getElementById('tokenOperationStatus');
+            
+            operationStatusDiv.innerHTML = '🔄 正在设置新令牌...';
+            operationStatusDiv.className = '';
+            operationStatusDiv.style.display = 'block';
+            
+            try {
+                const response = await fetch('/api/exit-token/set', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    operationStatusDiv.className = 'success';
+                    operationStatusDiv.innerHTML = `
+                        ✅ <strong>令牌设置成功！</strong><br>
+                        新令牌：<code style='background: #f5f5f5; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-weight: bold;'>${data.token}</code><br>
+                        设置时间：${data.setTime}<br>
+                        <span style='color: #d32f2f;'>⚠️ 请记住此令牌，退出应用时需要输入</span>
+                    `;
+                    
+                    // 自动刷新状态
+                    setTimeout(() => {
+                        refreshTokenStatus();
+                    }, 1000);
+                } else {
+                    throw new Error(data.error || '设置令牌失败');
+                }
+            } catch (error) {
+                operationStatusDiv.className = 'error';
+                operationStatusDiv.innerHTML = `❌ 设置令牌失败：${error.message}`;
+            }
+        }
+        
+        async function clearExitToken() {
+            if (!confirm('确定要清除退出令牌吗？\\n\\n清除后应用将可以直接退出，不需要令牌验证。')) {
+                return;
+            }
+            
+            const operationStatusDiv = document.getElementById('tokenOperationStatus');
+            
+            operationStatusDiv.innerHTML = '🔄 正在清除令牌...';
+            operationStatusDiv.className = '';
+            operationStatusDiv.style.display = 'block';
+            
+            try {
+                const response = await fetch('/api/exit-token/clear', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    operationStatusDiv.className = 'success';
+                    operationStatusDiv.innerHTML = '✅ 令牌已成功清除！应用现在可以直接退出。';
+                    
+                    // 自动刷新状态
+                    setTimeout(() => {
+                        refreshTokenStatus();
+                    }, 1000);
+                } else {
+                    throw new Error(data.error || '清除令牌失败');
+                }
+            } catch (error) {
+                operationStatusDiv.className = 'error';
+                operationStatusDiv.innerHTML = `❌ 清除令牌失败：${error.message}`;
+            }
+        }
+
+        // 页面加载时自动刷新令牌状态
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshTokenStatus();
+        });
     </script>
 </body>
 </html>";
@@ -3020,6 +3272,83 @@ namespace ClassIsland.Services
                 {
                     // 如果无法发送错误响应，忽略异常
                 }
+            }
+        }
+
+        /// <summary>
+        /// 处理获取退出令牌状态的请求
+        /// </summary>
+        private async Task HandleExitTokenStatusRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                var currentToken = GetCurrentExitToken();
+                var status = new
+                {
+                    success = true,
+                    hasToken = !string.IsNullOrEmpty(currentToken),
+                    token = currentToken,
+                    setTime = _exitTokenSetTime != DateTime.MinValue ? _exitTokenSetTime.ToString("yyyy-MM-dd HH:mm:ss") : null
+                };
+                
+                await WriteJsonResponse(response, status);
+                _logger.LogInformation("返回退出令牌状态: 是否有令牌={HasToken}", status.hasToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理退出令牌状态请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理设置退出令牌的请求
+        /// </summary>
+        private async Task HandleSetExitTokenRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                var newToken = SetExitToken();
+                
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    message = "退出令牌已设置",
+                    token = newToken,
+                    setTime = _exitTokenSetTime.ToString("yyyy-MM-dd HH:mm:ss")
+                });
+                
+                _logger.LogInformation("通过Web API设置了新的退出令牌");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理设置退出令牌请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理清除退出令牌的请求
+        /// </summary>
+        private async Task HandleClearExitTokenRequest(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            try
+            {
+                ClearExitToken();
+                
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    message = "退出令牌已清除"
+                });
+                
+                _logger.LogInformation("通过Web API清除了退出令牌");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理清除退出令牌请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
             }
         }
     }
