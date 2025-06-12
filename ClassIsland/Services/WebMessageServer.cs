@@ -56,7 +56,9 @@ namespace ClassIsland.Services
         private int _autoCloseCount = 0;
         private DateTime _autoCloseStartTime = DateTime.MinValue;
         private readonly List<string> _autoCloseLog = new();
-        private const int AUTO_CLOSE_INTERVAL_MS = 30000; // 30秒间隔
+        private int _autoCloseIntervalMs = 30000; // 默认30秒间隔，可自定义
+        private const int MIN_INTERVAL_MS = 5000; // 最小5秒间隔
+        private const int MAX_INTERVAL_MS = 300000; // 最大5分钟间隔
         private const int MAX_LOG_ENTRIES = 100; // 最大日志条数
         
         /// <summary>
@@ -1573,11 +1575,19 @@ namespace ClassIsland.Services
 
         <div class='card'>
             <h2>🤖 自动关闭窗口</h2>
-            <p>后台自动监控并关闭包含指定关键词的窗口，每30秒自动检查一次，无需保持网页打开</p>
+            <p>后台自动监控并关闭包含指定关键词的窗口，可自定义检查间隔，无需保持网页打开</p>
             
             <div class='form-group'>
                 <label for='autoCloseKeyword'>关键词</label>
                 <input type='text' id='autoCloseKeyword' placeholder='输入要监控的关键词（如：游戏、视频等）' style='width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; box-sizing: border-box;'>
+            </div>
+            
+            <div class='form-group'>
+                <label for='autoCloseInterval'>检查间隔（秒）</label>
+                <input type='number' id='autoCloseInterval' value='30' min='5' max='300' placeholder='5-300秒' style='width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; box-sizing: border-box;'>
+                <small style='color: #666; font-size: 12px; margin-top: 5px; display: block;'>
+                    设置多长时间检查一次窗口列表（最小5秒，最大300秒）
+                </small>
             </div>
             
             <div class='form-group'>
@@ -1607,7 +1617,7 @@ namespace ClassIsland.Services
                 <strong>⚠️ 使用提醒：</strong>
                 <ul style='margin: 5px 0 0 20px; padding-left: 0;'>
                     <li><strong>监控在后台运行，无需保持网页打开</strong></li>
-                    <li>系统会每30秒自动检查一次窗口列表</li>
+                    <li>系统会按设置的间隔自动检查窗口列表</li>
                     <li>包含关键词的窗口标题将被自动关闭</li>
                     <li>关键词匹配不区分大小写</li>
                     <li>系统关键窗口和本程序窗口会被自动跳过</li>
@@ -2075,9 +2085,15 @@ namespace ClassIsland.Services
         async function startAutoClose() {
             const keyword = document.getElementById('autoCloseKeyword').value.trim();
             const forceClose = document.getElementById('autoCloseForceClose').checked;
+            const intervalSeconds = parseInt(document.getElementById('autoCloseInterval').value);
             
             if (!keyword) {
                 alert('请输入要监控的关键词！');
+                return;
+            }
+            
+            if (isNaN(intervalSeconds) || intervalSeconds < 5 || intervalSeconds > 300) {
+                alert('检查间隔必须是5到300秒之间的数字！');
                 return;
             }
             
@@ -2089,7 +2105,8 @@ namespace ClassIsland.Services
                     },
                     body: JSON.stringify({
                         keyword: keyword,
-                        forceClose: forceClose
+                        forceClose: forceClose,
+                        intervalSeconds: intervalSeconds
                     })
                 });
                 
@@ -2135,9 +2152,15 @@ namespace ClassIsland.Services
         async function testAutoClose() {
             const keyword = document.getElementById('autoCloseKeyword').value.trim();
             const forceClose = document.getElementById('autoCloseForceClose').checked;
+            const intervalSeconds = parseInt(document.getElementById('autoCloseInterval').value);
             
             if (!keyword) {
                 alert('请输入要监控的关键词！');
+                return;
+            }
+            
+            if (isNaN(intervalSeconds) || intervalSeconds < 5 || intervalSeconds > 300) {
+                alert('检查间隔必须是5到300秒之间的数字！');
                 return;
             }
             
@@ -2154,7 +2177,8 @@ namespace ClassIsland.Services
                     },
                     body: JSON.stringify({
                         keyword: keyword,
-                        forceClose: forceClose
+                        forceClose: forceClose,
+                        intervalSeconds: intervalSeconds
                     })
                 });
                 
@@ -3751,6 +3775,7 @@ namespace ClassIsland.Services
                 // 获取参数
                 string keyword = requestData.keyword?.ToString()?.Trim() ?? "";
                 bool forceClose = requestData.forceClose ?? false;
+                int intervalSeconds = requestData.intervalSeconds ?? 30; // 默认30秒
                 
                 if (string.IsNullOrEmpty(keyword))
                 {
@@ -3762,8 +3787,20 @@ namespace ClassIsland.Services
                     return;
                 }
                 
+                // 验证间隔范围 (5秒到5分钟)
+                int intervalMs = intervalSeconds * 1000;
+                if (intervalMs < MIN_INTERVAL_MS || intervalMs > MAX_INTERVAL_MS)
+                {
+                    response.StatusCode = 400;
+                    await WriteJsonResponse(response, new { 
+                        success = false, 
+                        error = $"检查间隔必须在 {MIN_INTERVAL_MS / 1000} 到 {MAX_INTERVAL_MS / 1000} 秒之间" 
+                    });
+                    return;
+                }
+                
                 // 启动自动关闭
-                bool started = StartAutoClose(keyword, forceClose);
+                bool started = StartAutoClose(keyword, forceClose, intervalMs);
                 
                 if (started)
                 {
@@ -3772,11 +3809,11 @@ namespace ClassIsland.Services
                         message = "自动关闭监控已启动",
                         keyword = keyword,
                         forceClose = forceClose,
-                        interval = AUTO_CLOSE_INTERVAL_MS / 1000
+                        interval = intervalMs / 1000
                     });
                     
-                    _logger.LogInformation("通过Web API启动了自动关闭监控: 关键词={Keyword}, 强制关闭={ForceClose}", 
-                        keyword, forceClose);
+                    _logger.LogInformation("通过Web API启动了自动关闭监控: 关键词={Keyword}, 强制关闭={ForceClose}, 间隔={Interval}秒", 
+                        keyword, forceClose, intervalMs / 1000);
                 }
                 else
                 {
@@ -3833,9 +3870,9 @@ namespace ClassIsland.Services
                     forceClose = _autoCloseForceClose,
                     count = _autoCloseCount,
                     startTime = _autoCloseStartTime != DateTime.MinValue ? _autoCloseStartTime.ToString("yyyy-MM-dd HH:mm:ss") : null,
-                    interval = AUTO_CLOSE_INTERVAL_MS / 1000,
+                    interval = _autoCloseIntervalMs / 1000,
                     nextCheck = _autoCloseRunning && _autoCloseTimer != null ? 
-                        _autoCloseStartTime.AddMilliseconds(AUTO_CLOSE_INTERVAL_MS * (_autoCloseCount + 1)).ToString("yyyy-MM-dd HH:mm:ss") : null
+                        _autoCloseStartTime.AddMilliseconds(_autoCloseIntervalMs * (_autoCloseCount + 1)).ToString("yyyy-MM-dd HH:mm:ss") : null
                 };
                 
                 await WriteJsonResponse(response, status);
@@ -3878,7 +3915,7 @@ namespace ClassIsland.Services
         /// <summary>
         /// 启动自动关闭监控
         /// </summary>
-        public bool StartAutoClose(string keyword, bool forceClose)
+        public bool StartAutoClose(string keyword, bool forceClose, int intervalMs = 30000)
         {
             if (_autoCloseRunning || string.IsNullOrEmpty(keyword))
             {
@@ -3887,6 +3924,7 @@ namespace ClassIsland.Services
             
             _autoCloseKeyword = keyword;
             _autoCloseForceClose = forceClose;
+            _autoCloseIntervalMs = intervalMs;
             _autoCloseRunning = true;
             _autoCloseCount = 0;
             _autoCloseStartTime = DateTime.Now;
@@ -3895,15 +3933,15 @@ namespace ClassIsland.Services
             {
                 _autoCloseLog.Clear();
                 AddAutoCloseLog($"🟢 自动关闭监控已启动，关键词：「{keyword}」");
-                AddAutoCloseLog($"📝 监控间隔：每{AUTO_CLOSE_INTERVAL_MS / 1000}秒检查一次");
+                AddAutoCloseLog($"📝 监控间隔：每{_autoCloseIntervalMs / 1000}秒检查一次");
                 AddAutoCloseLog($"⚡ 强制关闭模式：{(forceClose ? "启用" : "禁用")}");
             }
             
-            // 创建定时器，30秒后第一次执行，然后每30秒执行一次
-            _autoCloseTimer = new Timer(AutoCloseTimerCallback, null, AUTO_CLOSE_INTERVAL_MS, AUTO_CLOSE_INTERVAL_MS);
+            // 创建定时器，使用自定义间隔
+            _autoCloseTimer = new Timer(AutoCloseTimerCallback, null, _autoCloseIntervalMs, _autoCloseIntervalMs);
             
             _logger.LogInformation("自动关闭监控已启动: 关键词={Keyword}, 强制关闭={ForceClose}, 间隔={Interval}ms", 
-                keyword, forceClose, AUTO_CLOSE_INTERVAL_MS);
+                keyword, forceClose, _autoCloseIntervalMs);
             
             return true;
         }
