@@ -1595,20 +1595,7 @@ namespace ClassIsland.Services
 
         // 窗口关闭相关事件监听
         document.getElementById('closeWindowSelect').addEventListener('change', function() {
-            const closeButton = document.getElementById('closeWindowBtn');
-            const warning = document.getElementById('windowCloseWarning');
-            
-            if (this.value) {
-                closeButton.disabled = false;
-                closeButton.style.opacity = '1';
-                closeButton.style.cursor = 'pointer';
-                warning.style.display = 'block';
-            } else {
-                closeButton.disabled = true;
-                closeButton.style.opacity = '0.5';
-                closeButton.style.cursor = 'not-allowed';
-                warning.style.display = 'none';
-            }
+            updateCloseWindowButtonState();
         });
 
         async function takeScreenshot() {
@@ -1748,6 +1735,28 @@ namespace ClassIsland.Services
             } finally {
                 refreshBtn.disabled = false;
                 refreshBtn.textContent = '🔄 刷新';
+                
+                // 刷新完成后更新按钮状态
+                updateCloseWindowButtonState();
+            }
+        }
+        
+        // 更新关闭窗口按钮状态的函数
+        function updateCloseWindowButtonState() {
+            const closeWindowSelect = document.getElementById('closeWindowSelect');
+            const closeButton = document.getElementById('closeWindowBtn');
+            const warning = document.getElementById('windowCloseWarning');
+            
+            if (closeWindowSelect.value && !closeWindowSelect.options[closeWindowSelect.selectedIndex].disabled) {
+                closeButton.disabled = false;
+                closeButton.style.opacity = '1';
+                closeButton.style.cursor = 'pointer';
+                warning.style.display = 'block';
+            } else {
+                closeButton.disabled = true;
+                closeButton.style.opacity = '0.5';
+                closeButton.style.cursor = 'not-allowed';
+                warning.style.display = 'none';
             }
         }
 
