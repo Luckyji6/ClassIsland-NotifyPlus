@@ -15,6 +15,8 @@ using System.Linq;
 using ClassIsland.Core.Abstractions.Services;
 using ClassIsland.Core;
 using System.Web;
+using ClassIsland.Shared.Models.Profile;
+using ClassIsland.Shared;
 
 namespace ClassIsland.Services
 {
@@ -60,6 +62,10 @@ namespace ClassIsland.Services
         private const int MIN_INTERVAL_MS = 5000; // 最小5秒间隔
         private const int MAX_INTERVAL_MS = 300000; // 最大5分钟间隔
         private const int MAX_LOG_ENTRIES = 100; // 最大日志条数
+        
+        // 直接读取课表相关字段
+        private readonly IProfileService _profileService;
+        private readonly SettingsService _settingsService;
         
         /// <summary>
         /// 验证退出令牌
@@ -142,7 +148,9 @@ namespace ClassIsland.Services
             ScheduleApiService scheduleApiService,
             ScreenshotService screenshotService,
             WindowControlService windowControlService,
-            IHostApplicationLifetime hostApplicationLifetime)
+            IHostApplicationLifetime hostApplicationLifetime,
+            IProfileService profileService,
+            SettingsService settingsService)
         {
             _logger = logger;
             _notificationProvider = notificationProvider;
@@ -152,6 +160,8 @@ namespace ClassIsland.Services
             _screenshotService = screenshotService;
             _windowControlService = windowControlService;
             _hostApplicationLifetime = hostApplicationLifetime;
+            _profileService = profileService;
+            _settingsService = settingsService;
             
             // 在构造函数中记录初始化信息
             _logger.LogInformation("WebMessageServer服务已创建，等待启动...");
@@ -2626,6 +2636,188 @@ namespace ClassIsland.Services
         {
             try
             {
+                _logger.LogInformation("开始处理课表请求，尝试直接读取配置文件");
+                
+                // 直接读取配置文件
+                var scheduleData = await LoadScheduleDirectlyAsync();
+                
+                if (scheduleData == null)
+                {
+                    _logger.LogWarning("直接读取配置文件失败，尝试使用系统服务");
+                    // 如果直接读取失败，回退到使用系统服务
+                    await HandleScheduleRequestFallback(response);
+                    return;
+                }
+
+                await WriteJsonResponse(response, scheduleData);
+                _logger.LogInformation("成功使用直接读取方式获取课表信息");
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "获取课表信息时出错");
+                await WriteJsonResponse(response, new { error = "获取课表失败" });
+            }
+        }
+
+        /// <summary>
+        /// 直接读取配置文件获取课表信息
+        /// </summary>
+        private async Task<object?> LoadScheduleDirectlyAsync()
+        {
+            try
+            {
+                // 获取当前配置文件名
+                string profileFileName = _settingsService.Settings.SelectedProfile;
+                if (string.IsNullOrEmpty(profileFileName))
+                {
+                    profileFileName = "Default.json";
+                }
+                
+                // 构建配置文件路径
+                string profilesPath = Path.Combine(App.AppRootFolderPath, "Profiles");
+                string profilePath = Path.Combine(profilesPath, profileFileName);
+                
+                _logger.LogInformation("尝试读取配置文件: {ProfilePath}", profilePath);
+                
+                if (!File.Exists(profilePath))
+                {
+                    _logger.LogWarning("配置文件不存在: {ProfilePath}", profilePath);
+                    return null;
+                }
+
+                // 读取并解析配置文件
+                string jsonContent = await File.ReadAllTextAsync(profilePath);
+                var profile = JsonConvert.DeserializeObject<Profile>(jsonContent);
+                
+                if (profile == null)
+                {
+                    _logger.LogError("无法解析配置文件");
+                    return null;
+                }
+                
+                // 获取当前日期和时间
+                var currentTime = DateTime.Now;
+                var currentDayOfWeek = (int)currentTime.DayOfWeek;
+                
+                // 查找适用的课表
+                var currentClassPlan = FindCurrentClassPlan(profile, currentTime);
+                if (currentClassPlan == null)
+                {
+                    _logger.LogInformation("未找到适用的课表");
+                    return new { classes = new object[0], message = "今日没有课程安排" };
+                }
+                
+                // 获取时间表
+                if (!profile.TimeLayouts.TryGetValue(currentClassPlan.TimeLayoutId, out var timeLayout))
+                {
+                    _logger.LogWarning("未找到对应的时间表: {TimeLayoutId}", currentClassPlan.TimeLayoutId);
+                    return new { classes = new object[0], message = "时间表配置错误" };
+                }
+                
+                // 构建课表数据
+                var classes = BuildClassSchedule(currentClassPlan, timeLayout, profile.Subjects, currentTime);
+                
+                _logger.LogInformation("成功构建课表数据，共 {Count} 节课", classes.Count);
+                return new { classes };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "直接读取配置文件时出错");
+                return null;
+            }
+        }
+        
+        /// <summary>
+        /// 查找当前适用的课表
+        /// </summary>
+        private ClassPlan? FindCurrentClassPlan(Profile profile, DateTime currentTime)
+        {
+            var currentDate = currentTime.Date;
+            var currentDayOfWeek = (int)currentTime.DayOfWeek;
+            
+            // 检查是否有预定的课表
+            if (profile.OrderedSchedules.TryGetValue(currentDate, out var orderedSchedule)
+                && profile.ClassPlans.TryGetValue(orderedSchedule.ClassPlanId, out var orderedClassPlan))
+            {
+                _logger.LogInformation("使用预定课表: {ClassPlanName}", orderedClassPlan.Name);
+                return orderedClassPlan;
+            }
+            
+            // 检查临时课表
+            if (!string.IsNullOrEmpty(profile.TempClassPlanId)
+                && profile.ClassPlans.TryGetValue(profile.TempClassPlanId, out var tempClassPlan)
+                && profile.TempClassPlanSetupTime.Date <= currentDate)
+            {
+                _logger.LogInformation("使用临时课表: {ClassPlanName}", tempClassPlan.Name);
+                return tempClassPlan;
+            }
+            
+            // 查找符合条件的普通课表
+            foreach (var classPlan in profile.ClassPlans.Values)
+            {
+                if (!classPlan.IsEnabled || classPlan.IsOverlay)
+                    continue;
+                    
+                // 检查星期几
+                if (classPlan.TimeRule.WeekDay != currentDayOfWeek)
+                    continue;
+                    
+                // TODO: 可以添加更多的时间规则检查（如单双周等）
+                
+                _logger.LogInformation("使用普通课表: {ClassPlanName}", classPlan.Name);
+                return classPlan;
+            }
+            
+            return null;
+        }
+        
+        /// <summary>
+        /// 构建课表数据
+        /// </summary>
+        private List<object> BuildClassSchedule(ClassPlan classPlan, TimeLayout timeLayout, ObservableDictionary<string, Subject> subjects, DateTime currentTime)
+        {
+            var classes = new List<object>();
+            var currentTimeSpan = currentTime.TimeOfDay;
+            
+            // 获取时间布局中的课程时间点（TimeType = 0 表示上课时间）
+            var timePoints = timeLayout.Layouts.Where(item => item.TimeType == 0).ToList();
+            
+            for (int i = 0; i < Math.Min(classPlan.Classes.Count, timePoints.Count); i++)
+            {
+                var classInfo = classPlan.Classes[i];
+                var timePoint = timePoints[i];
+                
+                // 获取科目信息
+                string subjectName = "未安排课程";
+                if (!string.IsNullOrEmpty(classInfo.SubjectId) && subjects.TryGetValue(classInfo.SubjectId, out var subject))
+                {
+                    subjectName = subject.Name ?? "未知科目";
+                }
+                
+                // 判断是否为当前课程（注意要与TimeSpan比较）
+                bool isCurrent = currentTimeSpan >= timePoint.StartSecond.TimeOfDay && currentTimeSpan <= timePoint.EndSecond.TimeOfDay;
+                
+                classes.Add(new
+                {
+                    startTime = timePoint.StartSecond.ToString(@"HH:mm"),
+                    endTime = timePoint.EndSecond.ToString(@"HH:mm"),
+                    subject = subjectName,
+                    isCurrent = isCurrent,
+                    index = i,
+                    subjectId = classInfo.SubjectId
+                });
+            }
+            
+            return classes;
+        }
+
+        /// <summary>
+        /// 系统服务回退方案
+        /// </summary>
+        private async Task HandleScheduleRequestFallback(HttpListenerResponse response)
+        {
+            try
+            {
                 if (_lessonsService == null)
                 {
                     await WriteJsonResponse(response, new { error = "课表服务不可用" });
@@ -2683,7 +2875,7 @@ namespace ClassIsland.Services
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "获取课表信息时出错");
+                _logger?.LogError(ex, "使用系统服务获取课表信息时出错");
                 await WriteJsonResponse(response, new { error = "获取课表失败" });
             }
         }
