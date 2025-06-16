@@ -918,6 +918,32 @@ namespace ClassIsland.Services
                                     await HandleAutoCloseLogsRequest(response);
                                     continue;
                                 }
+                                else if (request.Url.AbsolutePath == "/api/slider-verification")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleSliderVerificationRequest(response);
+                                    continue;
+                                }
+                                else if (request.Url.AbsolutePath == "/api/class-time-status")
+                                {
+                                    // 检查是否已登录
+                                    if (!IsAuthenticated(request))
+                                    {
+                                        response.StatusCode = 401;
+                                        await WriteJsonResponse(response, new { error = "未授权访问", requireAuth = true });
+                                        continue;
+                                    }
+                                    
+                                    await HandleClassTimeStatusRequest(response);
+                                    continue;
+                                }
                             }
 
                             // 处理POST请求
@@ -1226,6 +1252,55 @@ namespace ClassIsland.Services
                     return;
                 }
 
+                // 检查是否在上课时间，如果是则需要二次验证
+                bool isInClassTime = await IsInClassTimeAsync();
+                _logger.LogInformation("上课时间检查结果: {IsInClassTime}, 客户端IP: {ClientIP}", isInClassTime, clientIp);
+                
+                if (isInClassTime)
+                {
+                    _logger.LogInformation("检测到上课时间，开始二次验证流程");
+                    
+                    // 检查是否提供了滑轨验证码
+                    if (!data.ContainsKey("sliderVerification") || string.IsNullOrEmpty(data["sliderVerification"].ToString()))
+                    {
+                        _logger.LogWarning("上课时间发送消息但缺少滑轨验证码");
+                        response.StatusCode = 403;
+                        await WriteJsonResponse(response, new { 
+                            success = false, 
+                            error = "当前为上课时间，需要滑轨验证",
+                            requireSliderVerification = true,
+                            classTimeWarning = "检测到当前为上课时间，为避免干扰课堂，请完成滑轨验证后再发送消息"
+                        });
+                        
+                        await _securityService.LogMessageHistoryAsync("上课时间发送消息被拒绝：缺少滑轨验证", false, clientIp);
+                        return;
+                    }
+
+                    // 验证滑轨验证码
+                    string sliderCode = data["sliderVerification"].ToString() ?? "";
+                    _logger.LogInformation("收到滑轨验证码，开始验证: {SliderCode}", sliderCode);
+                    
+                    if (!ValidateSliderVerification(sliderCode))
+                    {
+                        _logger.LogWarning("滑轨验证码验证失败，拒绝消息发送");
+                        response.StatusCode = 403;
+                        await WriteJsonResponse(response, new { 
+                            success = false, 
+                            error = "滑轨验证失败，请重新验证",
+                            requireSliderVerification = true
+                        });
+                        
+                        await _securityService.LogMessageHistoryAsync("上课时间发送消息被拒绝：滑轨验证失败", false, clientIp);
+                        return;
+                    }
+
+                    _logger.LogInformation("上课时间消息发送通过滑轨验证，客户端IP: {ClientIP}", clientIp);
+                }
+                else
+                {
+                    _logger.LogInformation("当前非上课时间，跳过滑轨验证");
+                }
+
                 // 获取消息内容
                 string message = data["message"].ToString() ?? "";
                 bool useSpeech = data.ContainsKey("speech") && Convert.ToBoolean(data["speech"]);
@@ -1258,7 +1333,8 @@ namespace ClassIsland.Services
                 }
 
                 // 记录消息历史
-                await _securityService.LogMessageHistoryAsync(message, success, clientIp);
+                string logMessage = isInClassTime ? $"[上课时间-已验证] {message}" : message;
+                await _securityService.LogMessageHistoryAsync(logMessage, success, clientIp);
 
                 // 发送成功响应
                 _logger.LogInformation("已接收到Web消息请求: {Message}", message);
@@ -1723,16 +1799,19 @@ namespace ClassIsland.Services
             statusDiv.style.display = 'block';
             
             try {
+                // 先尝试发送消息
+                let requestData = {
+                    message,
+                    speech,
+                    duration: parseInt(duration)
+                };
+                
                 const response = await fetch('/', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({
-                        message,
-                        speech,
-                        duration: parseInt(duration)
-                    })
+                    body: JSON.stringify(requestData)
                 });
                 
                 const data = await response.json();
@@ -1741,6 +1820,56 @@ namespace ClassIsland.Services
                     statusDiv.className = 'success';
                     statusDiv.textContent = '✅ 提醒已发送成功！';
                     document.getElementById('message').value = '';
+                } else if (data.requireSliderVerification) {
+                    // 需要滑轨验证
+                    statusDiv.className = 'error';
+                    statusDiv.innerHTML = `
+                        <div style='margin-bottom: 15px;'>
+                            <strong>⚠️ ${data.classTimeWarning || data.error}</strong>
+                        </div>
+                        <div id='sliderContainer' style='margin: 15px 0;'>
+                            <div style='margin-bottom: 10px;'>请拖动滑块完成验证：</div>
+                            <div id='sliderTrack' style='position: relative; width: 300px; height: 40px; background: #f0f0f0; border-radius: 20px; margin: 10px 0;'>
+                                <div id='sliderButton' style='position: absolute; left: 0; top: 0; width: 40px; height: 40px; background: #4CAF50; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; user-select: none;'>→</div>
+                                <div style='position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #666; pointer-events: none;'>拖动滑块验证</div>
+                            </div>
+                            <button type='button' id='retryWithVerification' style='background: #4CAF50; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-top: 10px;' disabled>
+                                重新发送消息
+                            </button>
+                        </div>
+                    `;
+                    
+                    // 初始化滑轨验证
+                    initSliderVerification('retryWithVerification', async (verificationCode) => {
+                        // 重新发送消息，带上验证码
+                        requestData.sliderVerification = verificationCode;
+                        
+                        statusDiv.innerHTML = '<div class=""loading""></div>正在发送...';
+                        statusDiv.className = '';
+                        
+                        try {
+                            const retryResponse = await fetch('/', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify(requestData)
+                            });
+                            
+                            const retryData = await retryResponse.json();
+                            
+                            if (retryResponse.ok) {
+                                statusDiv.className = 'success';
+                                statusDiv.textContent = '✅ 提醒已发送成功！';
+                                document.getElementById('message').value = '';
+                            } else {
+                                throw new Error(retryData.error || '发送失败');
+                            }
+                        } catch (error) {
+                            statusDiv.className = 'error';
+                            statusDiv.textContent = '❌ ' + (error.message || '网络请求失败');
+                        }
+                    });
                 } else {
                     throw new Error(data.error || '发送失败');
                 }
@@ -1992,15 +2121,18 @@ namespace ClassIsland.Services
             closeButton.disabled = true;
             
             try {
+                // 先尝试关闭窗口
+                let requestData = {
+                    windowHandle: windowHandle,
+                    forceClose: forceClose
+                };
+                
                 const response = await fetch('/api/close-window', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({
-                        windowHandle: windowHandle,
-                        forceClose: forceClose
-                    })
+                    body: JSON.stringify(requestData)
                 });
                 
                 const result = await response.json();
@@ -2013,6 +2145,60 @@ namespace ClassIsland.Services
                     setTimeout(() => {
                         refreshCloseWindows();
                     }, 1000);
+                } else if (result.requireSliderVerification) {
+                    // 需要滑轨验证
+                    statusDiv.className = 'error';
+                    statusDiv.innerHTML = `
+                        <div style='margin-bottom: 15px;'>
+                            <strong>⚠️ ${result.classTimeWarning || result.error}</strong>
+                        </div>
+                        <div id='windowSliderContainer' style='margin: 15px 0;'>
+                            <div style='margin-bottom: 10px;'>请拖动滑块完成验证：</div>
+                            <div id='windowSliderTrack' style='position: relative; width: 300px; height: 40px; background: #f0f0f0; border-radius: 20px; margin: 10px 0;'>
+                                <div id='windowSliderButton' style='position: absolute; left: 0; top: 0; width: 40px; height: 40px; background: #f44336; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; user-select: none;'>→</div>
+                                <div style='position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #666; pointer-events: none;'>拖动滑块验证</div>
+                            </div>
+                            <button type='button' id='retryCloseWindow' style='background: #f44336; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-top: 10px;' disabled>
+                                重新关闭窗口
+                            </button>
+                        </div>
+                    `;
+                    
+                    // 初始化滑轨验证
+                    initSliderVerification('retryCloseWindow', async (verificationCode) => {
+                        // 重新关闭窗口，带上验证码
+                        requestData.sliderVerification = verificationCode;
+                        
+                        statusDiv.innerHTML = '🔄 正在关闭窗口...';
+                        statusDiv.className = '';
+                        
+                        try {
+                            const retryResponse = await fetch('/api/close-window', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify(requestData)
+                            });
+                            
+                            const retryResult = await retryResponse.json();
+                            
+                            if (retryResult.success) {
+                                statusDiv.className = 'success';
+                                statusDiv.innerHTML = `✅ 成功关闭窗口：${retryResult.windowTitle || windowTitle}<br>方法：${retryResult.method || (forceClose ? '强制终止进程' : '发送关闭消息')}`;
+                                
+                                // 自动刷新窗口列表
+                                setTimeout(() => {
+                                    refreshCloseWindows();
+                                }, 1000);
+                            } else {
+                                throw new Error(retryResult.errorMessage || retryResult.error || '关闭窗口失败');
+                            }
+                        } catch (error) {
+                            statusDiv.className = 'error';
+                            statusDiv.innerHTML = `❌ 关闭窗口失败：${error.message}`;
+                        }
+                    }, 'windowSliderTrack', 'windowSliderButton');
                 } else {
                     throw new Error(result.errorMessage || result.error || '关闭窗口失败');
                 }
@@ -2373,6 +2559,141 @@ namespace ClassIsland.Services
             if (autoCloseRefreshInterval) {
                 clearInterval(autoCloseRefreshInterval);
                 autoCloseRefreshInterval = null;
+            }
+        }
+
+        // 滑轨验证功能
+        function initSliderVerification(buttonId, onSuccess, trackId = 'sliderTrack', sliderId = 'sliderButton') {
+            const track = document.getElementById(trackId);
+            const slider = document.getElementById(sliderId);
+            const button = document.getElementById(buttonId);
+            
+            if (!track || !slider || !button) {
+                console.error('滑轨验证元素未找到');
+                return;
+            }
+            
+            let isDragging = false;
+            let startX = 0;
+            let currentX = 0;
+            let sliderCompleted = false;
+            let verificationCode = null;
+            
+            const trackWidth = track.offsetWidth;
+            const sliderWidth = slider.offsetWidth;
+            const maxPosition = trackWidth - sliderWidth;
+            
+            // 鼠标事件
+            slider.addEventListener('mousedown', startDrag);
+            document.addEventListener('mousemove', drag);
+            document.addEventListener('mouseup', endDrag);
+            
+            // 触摸事件（移动端支持）
+            slider.addEventListener('touchstart', startDrag);
+            document.addEventListener('touchmove', drag);
+            document.addEventListener('touchend', endDrag);
+            
+            function startDrag(e) {
+                if (sliderCompleted) return;
+                
+                isDragging = true;
+                startX = e.type === 'mousedown' ? e.clientX : e.touches[0].clientX;
+                currentX = parseInt(slider.style.left) || 0;
+                slider.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+            
+            function drag(e) {
+                if (!isDragging || sliderCompleted) return;
+                
+                const clientX = e.type === 'mousemove' ? e.clientX : e.touches[0].clientX;
+                const deltaX = clientX - startX;
+                let newPosition = currentX + deltaX;
+                
+                // 限制滑块位置
+                newPosition = Math.max(0, Math.min(newPosition, maxPosition));
+                
+                slider.style.left = newPosition + 'px';
+                
+                // 更新轨道背景色
+                const progress = newPosition / maxPosition;
+                track.style.background = `linear-gradient(to right, #4CAF50 ${progress * 100}%, #f0f0f0 ${progress * 100}%)`;
+                
+                // 检查是否完成
+                if (newPosition >= maxPosition * 0.9) { // 90%即可完成
+                    completeSlider();
+                }
+                
+                e.preventDefault();
+            }
+            
+            function endDrag() {
+                if (!isDragging) return;
+                
+                isDragging = false;
+                slider.style.cursor = 'pointer';
+                
+                // 如果没有完成，回弹到起始位置
+                if (!sliderCompleted) {
+                    slider.style.transition = 'left 0.3s ease';
+                    slider.style.left = '0px';
+                    track.style.background = '#f0f0f0';
+                    
+                    setTimeout(() => {
+                        slider.style.transition = '';
+                    }, 300);
+                }
+            }
+            
+            async function completeSlider() {
+                if (sliderCompleted) return;
+                
+                sliderCompleted = true;
+                slider.style.left = maxPosition + 'px';
+                slider.innerHTML = '✓';
+                slider.style.background = '#4CAF50';
+                track.style.background = '#4CAF50';
+                
+                // 从服务端获取验证码
+                try {
+                    const response = await fetch('/api/slider-verification');
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        verificationCode = data.verificationCode;
+                        button.disabled = false;
+                        button.style.opacity = '1';
+                        
+                        // 绑定按钮点击事件
+                        button.onclick = () => {
+                            if (onSuccess && verificationCode) {
+                                onSuccess(verificationCode);
+                            }
+                        };
+                        
+                        // 显示成功提示
+                        const successMsg = document.createElement('div');
+                        successMsg.style.cssText = 'color: #4CAF50; font-size: 14px; margin-top: 5px;';
+                        successMsg.textContent = '✅ 验证成功，请点击按钮继续';
+                        track.parentNode.appendChild(successMsg);
+                    } else {
+                        throw new Error(data.error || '获取验证码失败');
+                    }
+                } catch (error) {
+                    console.error('获取验证码失败:', error);
+                    // 显示错误提示
+                    const errorMsg = document.createElement('div');
+                    errorMsg.style.cssText = 'color: #f44336; font-size: 14px; margin-top: 5px;';
+                    errorMsg.textContent = '❌ 获取验证码失败，请重试';
+                    track.parentNode.appendChild(errorMsg);
+                    
+                    // 重置滑块状态
+                    sliderCompleted = false;
+                    slider.style.left = '0px';
+                    slider.innerHTML = '→';
+                    slider.style.background = '#4CAF50';
+                    track.style.background = '#f0f0f0';
+                }
             }
         }
     </script>
@@ -2809,6 +3130,221 @@ namespace ClassIsland.Services
             }
             
             return classes;
+        }
+
+        /// <summary>
+        /// 判断当前是否在上课时间
+        /// </summary>
+        private async Task<bool> IsInClassTimeAsync()
+        {
+            try
+            {
+                // 首先尝试通过系统服务判断
+                if (_lessonsService != null && _lessonsService.IsClassPlanLoaded)
+                {
+                    var currentTimeLayoutItem = _lessonsService.CurrentTimeLayoutItem;
+                    if (currentTimeLayoutItem != null && currentTimeLayoutItem.TimeType == 0)
+                    {
+                        return true;
+                    }
+                }
+
+                // 如果系统服务不可用，直接读取配置文件判断
+                var scheduleData = await LoadScheduleDirectlyAsync();
+                if (scheduleData != null)
+                {
+                    var scheduleObj = scheduleData as dynamic;
+                    if (scheduleObj?.classes != null)
+                    {
+                        var currentTime = DateTime.Now.TimeOfDay;
+                        foreach (var classItem in scheduleObj.classes)
+                        {
+                            if (classItem.isCurrent == true)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "判断是否在上课时间时出错");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 验证滑轨验证码
+        /// </summary>
+        private bool ValidateSliderVerification(string sliderCode)
+        {
+            try
+            {
+                _logger.LogInformation("开始验证滑轨验证码: {SliderCode}", sliderCode);
+                
+                // 临时调试：允许特殊验证码用于测试
+                if (sliderCode == "slider_test_bypass" || sliderCode == "test")
+                {
+                    _logger.LogInformation("使用测试绕过验证码");
+                    return true;
+                }
+                
+                // 简单的滑轨验证逻辑：验证码应该是一个特定格式的字符串
+                // 格式：slider_[timestamp]_[random]，其中timestamp在10分钟内有效
+                if (string.IsNullOrEmpty(sliderCode) || !sliderCode.StartsWith("slider_"))
+                {
+                    _logger.LogWarning("滑轨验证码格式错误: {SliderCode}", sliderCode);
+                    return false;
+                }
+
+                var parts = sliderCode.Split('_');
+                if (parts.Length != 3)
+                {
+                    _logger.LogWarning("滑轨验证码分段数量错误: {Parts}", parts.Length);
+                    return false;
+                }
+
+                // 验证时间戳
+                if (long.TryParse(parts[1], out long timestamp))
+                {
+                    // 使用UTC时间进行比较，确保与生成时的时间基准一致
+                    var codeTimeUtc = DateTimeOffset.FromUnixTimeMilliseconds(timestamp).UtcDateTime;
+                    var currentTimeUtc = DateTime.UtcNow;
+                    var timeDiff = currentTimeUtc - codeTimeUtc;
+                    
+                    _logger.LogInformation("验证详情 - 时间戳: {Timestamp}, 验证码UTC时间: {CodeTimeUtc}, 当前UTC时间: {CurrentTimeUtc}, 时间差: {TimeDiff}分钟", 
+                        timestamp,
+                        codeTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fff"), 
+                        currentTimeUtc.ToString("yyyy-MM-dd HH:mm:ss.fff"), 
+                        timeDiff.TotalMinutes);
+                    
+                    // 验证码在10分钟内有效，允许一定的时间误差（包括未来1分钟内的验证码）
+                    if (timeDiff.TotalMinutes <= 10 && timeDiff.TotalMinutes >= -1)
+                    {
+                        _logger.LogInformation("滑轨验证码验证成功");
+                        return true;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("滑轨验证码已过期或时间无效: 时间差{TimeDiff}分钟", timeDiff.TotalMinutes);
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("无法解析时间戳: {Timestamp}", parts[1]);
+                }
+
+                _logger.LogWarning("滑轨验证码验证失败");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "验证滑轨验证码时出错");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 生成滑轨验证码
+        /// </summary>
+        private string GenerateSliderVerification()
+        {
+            // 使用本地时间的Unix时间戳，避免时区问题
+            var localTime = DateTime.Now;
+            var utcTime = localTime.ToUniversalTime();
+            var timestamp = ((DateTimeOffset)utcTime).ToUnixTimeMilliseconds();
+            var random = new Random().Next(1000, 9999);
+            
+            _logger.LogInformation("生成验证码 - 本地时间: {LocalTime}, UTC时间: {UtcTime}, 时间戳: {Timestamp}", 
+                localTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                utcTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                timestamp);
+            
+            return $"slider_{timestamp}_{random}";
+        }
+
+        /// <summary>
+        /// 处理滑轨验证请求
+        /// </summary>
+        private async Task HandleSliderVerificationRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                var verificationCode = GenerateSliderVerification();
+                _logger.LogInformation("生成滑轨验证码: {Code}", verificationCode);
+                
+                // 添加调试信息
+                var debugInfo = new
+                {
+                    success = true,
+                    verificationCode = verificationCode,
+                    message = "滑轨验证码已生成",
+                    validMinutes = 10,
+                    timestamp = ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds(),
+                    currentTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                    currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                    testBypass = "slider_test_bypass"
+                };
+                
+                await WriteJsonResponse(response, debugInfo);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理滑轨验证请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
+        }
+
+        /// <summary>
+        /// 处理上课时间状态请求
+        /// </summary>
+        private async Task HandleClassTimeStatusRequest(HttpListenerResponse response)
+        {
+            try
+            {
+                bool isInClassTime = await IsInClassTimeAsync();
+                
+                // 获取当前课程信息
+                string currentSubject = "无课程";
+                string currentTimeRange = "";
+                
+                if (isInClassTime && _lessonsService != null && _lessonsService.IsClassPlanLoaded)
+                {
+                    var currentTimeLayoutItem = _lessonsService.CurrentTimeLayoutItem;
+                    var currentSubjectObj = _lessonsService.CurrentSubject;
+                    
+                    if (currentSubjectObj != null)
+                    {
+                        currentSubject = currentSubjectObj.Name ?? "未知课程";
+                    }
+                    
+                    if (currentTimeLayoutItem != null)
+                    {
+                        currentTimeRange = $"{currentTimeLayoutItem.StartSecond:HH:mm}-{currentTimeLayoutItem.EndSecond:HH:mm}";
+                    }
+                }
+                
+                await WriteJsonResponse(response, new { 
+                    success = true, 
+                    isInClassTime = isInClassTime,
+                    currentSubject = currentSubject,
+                    currentTimeRange = currentTimeRange,
+                    message = isInClassTime ? "当前为上课时间" : "当前非上课时间",
+                    timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                });
+                
+                _logger.LogInformation("返回上课时间状态: {IsInClassTime}", isInClassTime);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理上课时间状态请求时出错");
+                response.StatusCode = 500;
+                await WriteJsonResponse(response, new { success = false, error = "服务器内部错误" });
+            }
         }
 
         /// <summary>
@@ -3852,6 +4388,7 @@ namespace ClassIsland.Services
                 // 获取参数
                 string windowHandleStr = requestData.windowHandle?.ToString() ?? "";
                 bool forceClose = requestData.forceClose ?? false;
+                bool isAutoClose = requestData.isAutoClose ?? false; // 标识是否为自动关闭窗口操作
                 
                 if (string.IsNullOrEmpty(windowHandleStr) || !IntPtr.TryParse(windowHandleStr, out IntPtr windowHandle))
                 {
@@ -3862,9 +4399,46 @@ namespace ClassIsland.Services
                     });
                     return;
                 }
+
+                // 检查是否在上课时间，如果是且不是自动关闭则需要二次验证
+                bool isInClassTime = await IsInClassTimeAsync();
+                if (isInClassTime && !isAutoClose)
+                {
+                    // 检查是否提供了滑轨验证码
+                    string sliderCode = requestData.sliderVerification?.ToString() ?? "";
+                    if (string.IsNullOrEmpty(sliderCode))
+                    {
+                        response.StatusCode = 403;
+                        await WriteJsonResponse(response, new { 
+                            success = false, 
+                            error = "当前为上课时间，需要滑轨验证",
+                            requireSliderVerification = true,
+                            classTimeWarning = "检测到当前为上课时间，为避免干扰课堂，请完成滑轨验证后再关闭窗口"
+                        });
+                        
+                        await _securityService.LogMessageHistoryAsync("上课时间关闭窗口被拒绝：缺少滑轨验证", false, clientIp);
+                        return;
+                    }
+
+                    // 验证滑轨验证码
+                    if (!ValidateSliderVerification(sliderCode))
+                    {
+                        response.StatusCode = 403;
+                        await WriteJsonResponse(response, new { 
+                            success = false, 
+                            error = "滑轨验证失败，请重新验证",
+                            requireSliderVerification = true
+                        });
+                        
+                        await _securityService.LogMessageHistoryAsync("上课时间关闭窗口被拒绝：滑轨验证失败", false, clientIp);
+                        return;
+                    }
+
+                    _logger.LogInformation("上课时间关闭窗口通过滑轨验证，客户端IP: {ClientIP}", clientIp);
+                }
                 
-                _logger.LogInformation("收到关闭窗口请求: 句柄={Handle}, 强制关闭={ForceClose}, 客户端IP={ClientIP}", 
-                    windowHandle, forceClose, clientIp);
+                _logger.LogInformation("收到关闭窗口请求: 句柄={Handle}, 强制关闭={ForceClose}, 自动关闭={IsAutoClose}, 客户端IP={ClientIP}", 
+                    windowHandle, forceClose, isAutoClose, clientIp);
                 
                 // 调用窗口控制服务关闭窗口
                 var result = _windowControlService.CloseWindow(windowHandle, forceClose);
@@ -3881,8 +4455,9 @@ namespace ClassIsland.Services
                     });
                     
                     // 记录操作日志
+                    string logPrefix = isInClassTime && !isAutoClose ? "[上课时间-已验证] " : (isAutoClose ? "[自动关闭] " : "");
                     await _securityService.LogMessageHistoryAsync(
-                        $"关闭窗口: {result.WindowTitle} ({result.ProcessName}) - {result.Method}", 
+                        $"{logPrefix}关闭窗口: {result.WindowTitle} ({result.ProcessName}) - {result.Method}", 
                         true, clientIp);
                     
                     _logger.LogInformation("关闭窗口成功: {Title} ({ProcessName}), 方法: {Method}, 客户端IP: {ClientIP}", 
