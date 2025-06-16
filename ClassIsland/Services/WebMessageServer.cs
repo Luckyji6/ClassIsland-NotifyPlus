@@ -689,78 +689,134 @@ namespace ClassIsland.Services
                         try
                         {
                             // 添加CORS头
-                            response.AddHeader("Access-Control-Allow-Origin", "*");
-                            response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                            response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+                                                response.AddHeader("Access-Control-Allow-Origin", "*");
+                    response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
 
-                            // 处理OPTIONS请求（预检请求）
-                            if (request.HttpMethod == "OPTIONS")
-                            {
-                                response.StatusCode = 200;
-                                response.Close();
-                                continue;
-                            }
+                    // 处理OPTIONS请求（预检请求）
+                    if (request.HttpMethod == "OPTIONS")
+                    {
+                        response.StatusCode = 200;
+                        response.ContentLength64 = 0;
+                        try
+                        {
+                            response.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "关闭OPTIONS响应时出错");
+                        }
+                        continue;
+                    }
 
                             // 处理GET请求（返回HTML页面）
                             if (request.HttpMethod == "GET")
                             {
                                 if (request.Url.AbsolutePath == "/" || request.Url.AbsolutePath == "/index.html")
                                 {
-                                    // 检查是否设置了令牌，如果未设置，重定向到设置页面
-                                    if (!_securityService.IsTokenConfigured)
-                                    {
-                                        response.StatusCode = 302; // 重定向
-                                        response.Headers.Add("Location", "/setup");
-                                        response.Close();
-                                        continue;
-                                    }
-                                    
-                                    // 检查是否已登录（通过cookie）
-                                    bool isAuthenticated = IsAuthenticated(request);
-                                    if (!isAuthenticated)
-                                    {
-                                        response.StatusCode = 302; // 重定向
-                                        response.Headers.Add("Location", "/login");
-                                        response.Close();
-                                        continue;
-                                    }
-                                    
-                                    var html = GenerateHtmlPage();
-                                    var buffer = Encoding.UTF8.GetBytes(html);
-                                    response.ContentType = "text/html; charset=utf-8";
-                                    response.ContentLength64 = buffer.Length;
-                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                                    response.Close();
-                                    continue;
+                                                        // 检查是否设置了令牌，如果未设置，重定向到设置页面
+                    if (!_securityService.IsTokenConfigured)
+                    {
+                        response.StatusCode = 302; // 重定向
+                        response.Headers.Add("Location", "/setup");
+                        response.ContentLength64 = 0;
+                        try
+                        {
+                            response.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "关闭重定向响应时出错");
+                        }
+                        continue;
+                    }
+                    
+                    // 检查是否已登录（通过cookie）
+                    bool isAuthenticated = IsAuthenticated(request);
+                    if (!isAuthenticated)
+                    {
+                        response.StatusCode = 302; // 重定向
+                        response.Headers.Add("Location", "/login");
+                        response.ContentLength64 = 0;
+                        try
+                        {
+                            response.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "关闭重定向响应时出错");
+                        }
+                        continue;
+                    }
+                    
+                    var html = GenerateHtmlPage();
+                    var buffer = Encoding.UTF8.GetBytes(html);
+                    response.ContentType = "text/html; charset=utf-8";
+                    response.ContentLength64 = buffer.Length;
+                    try
+                    {
+                        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                        response.OutputStream.Close();
+                        response.Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "写入HTML响应时出错");
+                    }
+                    continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/login")
                                 {
-                                    var html = GenerateLoginPage();
-                                    var buffer = Encoding.UTF8.GetBytes(html);
-                                    response.ContentType = "text/html; charset=utf-8";
-                                    response.ContentLength64 = buffer.Length;
-                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                                    response.Close();
-                                    continue;
+                                                        var html = GenerateLoginPage();
+                    var buffer = Encoding.UTF8.GetBytes(html);
+                    response.ContentType = "text/html; charset=utf-8";
+                    response.ContentLength64 = buffer.Length;
+                    try
+                    {
+                        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                        response.OutputStream.Close();
+                        response.Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "写入HTML响应时出错");
+                    }
+                    continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/setup")
                                 {
-                                    // 如果令牌已配置，重定向到登录页面
-                                    if (_securityService.IsTokenConfigured)
-                                    {
-                                        response.StatusCode = 302; // 重定向
-                                        response.Headers.Add("Location", "/login");
-                                        response.Close();
-                                        continue;
-                                    }
-                                    
-                                    var html = GenerateSetupPage();
-                                    var buffer = Encoding.UTF8.GetBytes(html);
-                                    response.ContentType = "text/html; charset=utf-8";
-                                    response.ContentLength64 = buffer.Length;
-                                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                                    response.Close();
-                                    continue;
+                                                        // 如果令牌已配置，重定向到登录页面
+                    if (_securityService.IsTokenConfigured)
+                    {
+                        response.StatusCode = 302; // 重定向
+                        response.Headers.Add("Location", "/login");
+                        response.ContentLength64 = 0;
+                        try
+                        {
+                            response.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "关闭重定向响应时出错");
+                        }
+                        continue;
+                    }
+                    
+                    var html = GenerateSetupPage();
+                    var buffer = Encoding.UTF8.GetBytes(html);
+                    response.ContentType = "text/html; charset=utf-8";
+                    response.ContentLength64 = buffer.Length;
+                    try
+                    {
+                        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                        response.OutputStream.Close();
+                        response.Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "写入HTML响应时出错");
+                    }
+                    continue;
                                 }
                                 else if (request.Url.AbsolutePath == "/api/schedule")
                                 {
@@ -957,13 +1013,21 @@ namespace ClassIsland.Services
                             // 特殊API路径处理
                             if (request.Url.AbsolutePath == "/api/cnm")
                             {
-                                response.StatusCode = 200;
-                                var specialBuffer = Encoding.UTF8.GetBytes("我也cnm");
-                                response.ContentType = "text/plain; charset=utf-8";
-                                response.ContentLength64 = specialBuffer.Length;
-                                await response.OutputStream.WriteAsync(specialBuffer, 0, specialBuffer.Length);
-                                response.Close();
-                                continue;
+                                                        response.StatusCode = 200;
+                        var specialBuffer = Encoding.UTF8.GetBytes("我也cnm");
+                        response.ContentType = "text/plain; charset=utf-8";
+                        response.ContentLength64 = specialBuffer.Length;
+                        try
+                        {
+                            await response.OutputStream.WriteAsync(specialBuffer, 0, specialBuffer.Length);
+                            response.OutputStream.Close();
+                            response.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "写入响应时出错");
+                        }
+                        continue;
                             }
                             // 处理schedule-api路径请求
                             else if (request.Url.AbsolutePath.StartsWith("/schedule-api/"))
@@ -1067,15 +1131,17 @@ namespace ClassIsland.Services
                             LastErrorMessage = $"处理Web请求错误: {ex.Message}";
                             try
                             {
-                                if (response != null && !response.OutputStream.CanWrite) continue;
-                                
-                                response.StatusCode = 500;
-                                response.StatusDescription = "Internal Server Error";
-                                var errorBuffer = Encoding.UTF8.GetBytes("500 - Internal Server Error");
-                                response.ContentType = "text/plain";
-                                response.ContentLength64 = errorBuffer.Length;
-                                await response.OutputStream.WriteAsync(errorBuffer, 0, errorBuffer.Length);
-                                response.Close();
+                                if (response != null && response.OutputStream.CanWrite)
+                                {
+                                    response.StatusCode = 500;
+                                    response.StatusDescription = "Internal Server Error";
+                                    var errorBuffer = Encoding.UTF8.GetBytes("500 - Internal Server Error");
+                                    response.ContentType = "text/plain";
+                                    response.ContentLength64 = errorBuffer.Length;
+                                    await response.OutputStream.WriteAsync(errorBuffer, 0, errorBuffer.Length);
+                                    response.OutputStream.Close();
+                                    response.Close();
+                                }
                             }
                             catch (Exception innerEx)
                             {
@@ -2306,12 +2372,30 @@ namespace ClassIsland.Services
 
         private async Task WriteJsonResponse(HttpListenerResponse response, object data)
         {
-            var json = JsonConvert.SerializeObject(data);
-            var buffer = Encoding.UTF8.GetBytes(json);
-            response.ContentType = "application/json; charset=utf-8";
-            response.ContentLength64 = buffer.Length;
-            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-            response.Close();
+            try
+            {
+                var json = JsonConvert.SerializeObject(data);
+                var buffer = Encoding.UTF8.GetBytes(json);
+                response.ContentType = "application/json; charset=utf-8";
+                response.ContentLength64 = buffer.Length;
+                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                response.OutputStream.Close();
+                response.Close();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "写入JSON响应时出错");
+                try
+                {
+                    if (!response.OutputStream.CanWrite) return;
+                    response.StatusCode = 500;
+                    response.Close();
+                }
+                catch
+                {
+                    // 忽略关闭时的异常
+                }
+            }
         }
 
         /// <summary>
@@ -3355,8 +3439,16 @@ namespace ClassIsland.Services
                 response.AddHeader("Content-Disposition", $"inline; filename=\"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png\"");
                 
                 // 写入截图数据
-                await response.OutputStream.WriteAsync(screenshotData, 0, screenshotData.Length);
-                response.Close();
+                try
+                {
+                    await response.OutputStream.WriteAsync(screenshotData, 0, screenshotData.Length);
+                    response.OutputStream.Close();
+                    response.Close();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "写入截图响应时出错");
+                }
                 
                 // 记录日志
                 await _securityService.LogMessageHistoryAsync($"{logMessage} - 成功", true, clientIp);
